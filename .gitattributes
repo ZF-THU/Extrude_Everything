@@ -1,0 +1,14 @@
+* text=auto
+
+*.py text eol=lf
+readme text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.blend binary
+*.obj binary
+*.mtl binary

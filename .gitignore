@@ -1,0 +1,57 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# IDE/editor metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local environment and secrets
+*.env
+*.local
+tmphgfgne0v.env
+
+# Pipeline/debug outputs
+debug/
+result.png
+result*.png
+*_result.png
+*_output.png
+*_mask_*.png
+*_cap_sweep.png
+*_side_bestcap_overlay.png
+*_bestcap.png
+*_side.png
+
+# Generated Blender/geometry artifacts
+*.blend
+*.blend1
+*.obj
+*.mtl
+
+# Local/generated run data
+my_run/
+blender_axonometric_dev_dataset/
+random_extrusion_dev_dataset/
+
+# Logs and reports generated during experiments
+*.log
+*.tmp
+*.bak
+*_backup_*.py
+
+# OS files
+.DS_Store
+Thumbs.db
