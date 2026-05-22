@@ -64,6 +64,8 @@ def main():
     parser.add_argument("--same-loop-endpoint-tol", type=float, default=5)
     parser.add_argument("--min-cap-total-arc", type=float, default=50)
     parser.add_argument("--split-segment-arc", type=float, default=30)
+    parser.add_argument("--split-peak-min-distance", type=float, default=10)
+    parser.add_argument("--split-optimize-max-iters", type=int, default=5)
     parser.add_argument(
         "--split-segment-arc30",
         action="store_const",
@@ -154,6 +156,10 @@ def main():
             str(args.min_cap_total_arc),
             "--split-segment-arc",
             str(args.split_segment_arc),
+            "--split-peak-min-distance",
+            str(args.split_peak_min_distance),
+            "--split-optimize-max-iters",
+            str(args.split_optimize_max_iters),
         ]
         if args.copy_side_iou_compare_percent is not None:
             extrusion_args.extend([

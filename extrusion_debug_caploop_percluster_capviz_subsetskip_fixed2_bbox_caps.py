@@ -363,14 +363,15 @@ def trace_strokes(skel, min_pixels=3):
     return strokes
 
 
-def split_stroke_at_corners(stroke, angle_thresh=15.0, min_pixels=3, window=5, segment_arc=50.0):
+def split_stroke_at_corners(stroke, angle_thresh=15.0, min_pixels=3, window=5, segment_arc=50.0, split_peak_min_distance=10.0, split_optimize_max_iters=5):
     """
     Split one traced stroke where left/right PCA segment directions change sharply.
 
     Every interior point is scored by the unoriented PCA axis angle between the
     left and right arc-length windows around that point. Points below
-    angle_thresh are discarded, and adjacent high-score points are reduced to
-    their local maximum before splitting.
+    angle_thresh are discarded. Adjacent high-score points are reduced to local
+    peaks, with accepted peaks separated by split_peak_min_distance along the
+    stroke arc before splitting.
     """
     pieces, _split_events, _candidate_events, _scan_events = split_stroke_at_corners_with_trace(
         stroke,
@@ -378,6 +379,8 @@ def split_stroke_at_corners(stroke, angle_thresh=15.0, min_pixels=3, window=5, s
         min_pixels=min_pixels,
         window=window,
         segment_arc=segment_arc,
+        split_peak_min_distance=split_peak_min_distance,
+        split_optimize_max_iters=split_optimize_max_iters,
     )
     return pieces
 
@@ -422,11 +425,14 @@ def walk_left_by_arc(stroke, i, stop_i=0, max_arc=50.0):
     return start
 
 
-def walk_right_by_arc(stroke, i, max_arc=50.0):
+def walk_right_by_arc(stroke, i, stop_i=None, max_arc=50.0):
     """Return exclusive right end index reached by walking forward up to max arc length."""
     end = int(i) + 1
     total = 0.0
-    for k in range(int(i), len(stroke) - 1):
+    if stop_i is None:
+        stop_i = len(stroke) - 1
+    stop_i = max(int(i), min(int(stop_i), len(stroke) - 1))
+    for k in range(int(i), stop_i):
         step = float(np.linalg.norm(stroke[k + 1] - stroke[k]))
         total += step
         end = k + 2
@@ -435,17 +441,17 @@ def walk_right_by_arc(stroke, i, max_arc=50.0):
     return end
 
 
-def corner_segment_windows(stroke, i, last_split=0, min_pixels=3, segment_arc=50.0):
+def corner_segment_windows(stroke, i, last_split=0, next_split=None, min_pixels=3, segment_arc=50.0):
     """Return local left/right arc-length windows for segment-angle validation."""
     segment_arc = max(float(segment_arc), 1.0)
     left_start = walk_left_by_arc(stroke, i, stop_i=last_split, max_arc=segment_arc)
-    right_end = walk_right_by_arc(stroke, i, max_arc=segment_arc)
+    right_end = walk_right_by_arc(stroke, i, stop_i=next_split, max_arc=segment_arc)
     left = stroke[left_start:int(i) + 1]
     right = stroke[int(i):right_end]
     return left, right
 
 
-def split_stroke_at_corners_with_trace(stroke, angle_thresh=15.0, min_pixels=3, window=5, segment_arc=50.0):
+def split_stroke_at_corners_with_trace(stroke, angle_thresh=15.0, min_pixels=3, window=5, segment_arc=50.0, split_peak_min_distance=10.0, split_optimize_max_iters=5):
     """Split one stroke at corners and return both pieces and split metadata."""
     if angle_thresh is None:
         return [stroke], [], [], []
@@ -454,14 +460,25 @@ def split_stroke_at_corners_with_trace(stroke, angle_thresh=15.0, min_pixels=3, 
     if len(stroke) < max(3, min_pixels * 2 + 1):
         return [stroke], [], [], []
 
-    split_events = []
+    split_peak_min_distance = max(0.0, float(split_peak_min_distance))
+    split_optimize_max_iters = max(1, int(split_optimize_max_iters))
+    arc_prefix = np.zeros(len(stroke), dtype=np.float64)
+    if len(stroke) > 1:
+        steps = np.sqrt(np.sum(np.diff(stroke, axis=0) ** 2, axis=1))
+        arc_prefix[1:] = np.cumsum(steps)
+
+    def arc_distance_between_indices(i, j):
+        i = max(0, min(int(i), len(stroke) - 1))
+        j = max(0, min(int(j), len(stroke) - 1))
+        return abs(float(arc_prefix[i] - arc_prefix[j]))
+
     candidate_events = []
     scan_events = []
-    high_score_events = []
 
-    for i in range(1, len(stroke) - 1):
+    def base_event_for_index(i, pass_id=0, stage="scan", prev_split=None, next_split=None):
+        i = int(i)
         p = stroke[i]
-        base_event = {
+        event = {
             "index": int(i),
             "point": (float(p[0]), float(p[1])),
             "raw_angle": 0.0,
@@ -474,8 +491,11 @@ def split_stroke_at_corners_with_trace(stroke, angle_thresh=15.0, min_pixels=3, 
             "high_score": False,
             "local_max": False,
             "reject_reason": "",
+            "optimization_pass": int(pass_id),
+            "optimization_stage": stage,
+            "prev_split_index": None if prev_split is None else int(prev_split),
+            "next_split_index": None if next_split is None else int(next_split),
         }
-
         # Debug-only local tangent angle. It no longer gates candidate creation.
         v1 = stroke[i] - stroke[i - 1]
         v2 = stroke[i + 1] - stroke[i]
@@ -488,39 +508,9 @@ def split_stroke_at_corners_with_trace(stroke, angle_thresh=15.0, min_pixels=3, 
             c = np.clip(c, -1.0, 1.0)
             raw_angle = math.degrees(math.acos(c))
             folded_angle = min(raw_angle, 180.0 - raw_angle)
-            base_event["raw_angle"] = float(raw_angle)
-            base_event["folded_angle"] = float(folded_angle)
-
-        left, right = corner_segment_windows(
-            stroke,
-            i,
-            last_split=0,
-            min_pixels=min_pixels,
-            segment_arc=segment_arc,
-        )
-        segment_angle = pca_segment_axis_angle(left, right)
-        event = dict(base_event)
-        event["segment_angle"] = float(segment_angle)
-        event["segment_left_len"] = int(len(left))
-        event["segment_right_len"] = int(len(right))
-
-        if len(left) < 2 or len(right) < 2:
-            event["reject_reason"] = "segment_window_too_short"
-        elif segment_angle < angle_thresh:
-            event["reject_reason"] = "segment_angle_below_threshold"
-        else:
-            event["high_score"] = True
-            event["reject_reason"] = "non_maximum_suppressed"
-            high_score_events.append(event)
-
-        scan_events.append(event)
-
-    groups = []
-    for event in high_score_events:
-        if not groups or int(event["index"]) != int(groups[-1][-1]["index"]) + 1:
-            groups.append([event])
-        else:
-            groups[-1].append(event)
+            event["raw_angle"] = float(raw_angle)
+            event["folded_angle"] = float(folded_angle)
+        return event
 
     def peak_rank_key(event):
         return (
@@ -541,86 +531,343 @@ def split_stroke_at_corners_with_trace(stroke, angle_thresh=15.0, min_pixels=3, 
                 peaks.append(event)
         return peaks if peaks else [max(group, key=peak_rank_key)]
 
-    last_split = 0
+    def neighbor_bounds(selected_indices, split_i):
+        left = [idx for idx in selected_indices if int(idx) < int(split_i)]
+        right = [idx for idx in selected_indices if int(idx) > int(split_i)]
+        has_prev_split = bool(left)
+        has_next_split = bool(right)
+        prev_split = max(left) if has_prev_split else 0
+        next_split = min(right) if has_next_split else None
+        return prev_split, next_split, has_prev_split, has_next_split
 
-    def try_peak(peak):
-        nonlocal last_split
-        peak["candidate"] = True
-        peak["local_max"] = True
+    def evaluate_split_event_between_neighbors(event, selected_indices, pass_id=0, stage="optimize"):
+        split_i = int(event.get("index", 0))
+        prev_split, next_split, has_prev_split, _has_next_split = neighbor_bounds(selected_indices, split_i)
+        updated = dict(event)
+        updated["accepted"] = False
+        updated["candidate"] = True
+        updated["local_max"] = True
+        updated["optimization_pass"] = int(pass_id)
+        updated["optimization_stage"] = stage
+        updated["prev_split_index"] = None if not has_prev_split else int(prev_split)
+        updated["next_split_index"] = None if next_split is None else int(next_split)
 
-        split_i = int(peak["index"])
-        if split_i - last_split < min_pixels:
-            peak["reject_reason"] = "near_previous_split"
-        elif len(stroke) - split_i < min_pixels:
-            peak["reject_reason"] = "right_segment_too_short"
-        else:
-            left, right = corner_segment_windows(
-                stroke,
-                split_i,
-                last_split=last_split,
-                min_pixels=min_pixels,
-                segment_arc=segment_arc,
-            )
-            final_segment_angle = pca_segment_axis_angle(left, right)
-            peak["segment_angle"] = float(final_segment_angle)
-            peak["segment_left_len"] = int(len(left))
-            peak["segment_right_len"] = int(len(right))
-            peak["segment_left_points"] = [
-                (float(q[0]), float(q[1])) for q in left
-            ]
-            peak["segment_right_points"] = [
-                (float(q[0]), float(q[1])) for q in right
-            ]
+        if split_i - int(prev_split) < min_pixels:
+            updated["reject_reason"] = "near_previous_split"
+            updated["optimized_score"] = 0.0
+            return updated, False
+        if next_split is None:
+            if len(stroke) - split_i < min_pixels:
+                updated["reject_reason"] = "right_segment_too_short"
+                updated["optimized_score"] = 0.0
+                return updated, False
+        elif int(next_split) - split_i < min_pixels:
+            updated["reject_reason"] = "right_segment_too_short_before_next_split"
+            updated["optimized_score"] = 0.0
+            return updated, False
 
-            if len(left) < 2 or len(right) < 2:
-                peak["reject_reason"] = "segment_window_too_short"
-            elif final_segment_angle < angle_thresh:
-                peak["reject_reason"] = "segment_angle_below_threshold_after_previous_split"
-            else:
-                peak["accepted"] = True
-                peak["reject_reason"] = ""
-                split_events.append(dict(peak))
-                last_split = split_i
+        if has_prev_split and split_peak_min_distance > 0.0 and arc_distance_between_indices(split_i, int(prev_split)) < split_peak_min_distance:
+            updated["reject_reason"] = "near_previous_split_distance"
+            updated["optimized_score"] = 0.0
+            return updated, False
+        if next_split is not None and split_peak_min_distance > 0.0 and arc_distance_between_indices(split_i, int(next_split)) < split_peak_min_distance:
+            updated["reject_reason"] = "near_next_split_distance"
+            updated["optimized_score"] = 0.0
+            return updated, False
 
-        candidate_events.append(dict(peak))
-        return bool(peak.get("accepted", False))
-
-    def fallback_rank_key(event):
-        support = min(
-            int(event.get("segment_left_len", 0)),
-            int(event.get("segment_right_len", 0)),
+        left, right = corner_segment_windows(
+            stroke,
+            split_i,
+            last_split=prev_split,
+            next_split=next_split,
+            min_pixels=min_pixels,
+            segment_arc=segment_arc,
         )
+        final_segment_angle = pca_segment_axis_angle(left, right)
+        updated["segment_angle"] = float(final_segment_angle)
+        updated["segment_left_len"] = int(len(left))
+        updated["segment_right_len"] = int(len(right))
+        updated["segment_left_points"] = [
+            (float(q[0]), float(q[1])) for q in left
+        ]
+        updated["segment_right_points"] = [
+            (float(q[0]), float(q[1])) for q in right
+        ]
+
+        if len(left) < 2 or len(right) < 2:
+            updated["reject_reason"] = "segment_window_too_short_between_splits"
+            updated["optimized_score"] = 0.0
+            return updated, False
+        if final_segment_angle < angle_thresh:
+            updated["reject_reason"] = "segment_angle_below_threshold_between_splits"
+            updated["optimized_score"] = float(final_segment_angle)
+            return updated, False
+
+        updated["accepted"] = True
+        updated["reject_reason"] = ""
+        updated["optimized_score"] = float(final_segment_angle)
+        return updated, True
+
+    def conflict_rank_key(event):
         return (
-            support,
-            float(event.get("segment_angle", 0.0)),
+            float(event.get("optimized_score", 0.0)),
+            float(event.get("raw_segment_angle", event.get("segment_angle", 0.0))),
             float(event.get("folded_angle", 0.0)),
             -int(event.get("index", 0)),
         )
 
-    for group in groups:
-        # Preserve the original behavior when the strongest local peak is a
-        # legal split. If that peak is only a boundary spike, fall back to an
-        # interior local peak instead of suppressing the whole high-score run.
-        peaks = local_peaks_in_high_score_group(group)
-        peak = max(peaks, key=peak_rank_key)
-        if try_peak(peak):
-            continue
+    def resolve_close_split_conflicts(proposed_indices, evaluated, pass_id):
+        kept = []
+        for idx in sorted(proposed_indices, key=lambda x: conflict_rank_key(evaluated[int(x)]), reverse=True):
+            if split_peak_min_distance > 0.0:
+                too_close_to = None
+                for kept_idx in kept:
+                    if arc_distance_between_indices(int(idx), int(kept_idx)) < split_peak_min_distance:
+                        too_close_to = int(kept_idx)
+                        break
+                if too_close_to is not None:
+                    rejected = dict(evaluated[int(idx)])
+                    rejected["accepted"] = False
+                    rejected["reject_reason"] = "rejected_min_distance_to_stronger_split"
+                    rejected["conflict_split_index"] = int(too_close_to)
+                    rejected["optimization_pass"] = int(pass_id)
+                    evaluated[int(idx)] = rejected
+                    continue
+            kept.append(int(idx))
+        return set(kept)
 
-        if peak.get("reject_reason", "") not in ("near_previous_split", "right_segment_too_short"):
-            continue
+    def split_segments(selected_indices):
+        interior = sorted(
+            {
+                int(idx)
+                for idx in selected_indices
+                if 0 < int(idx) < len(stroke) - 1
+            }
+        )
+        bounds = [0] + interior + [len(stroke) - 1]
+        return [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
 
-        fallback_peaks = [
-            p for p in peaks
-            if (
-                p is not peak
-                and int(p.get("index", 0)) - last_split >= min_pixels
-                and len(stroke) - int(p.get("index", 0)) >= min_pixels
+    def scan_event_between_neighbors(i, prev_split, next_split, pass_id=0, stage="scan"):
+        debug_next_split = None
+        if next_split is not None and int(next_split) < len(stroke) - 1:
+            debug_next_split = int(next_split)
+        event = base_event_for_index(
+            int(i),
+            pass_id=pass_id,
+            stage=stage,
+            prev_split=None if int(prev_split) == 0 else int(prev_split),
+            next_split=debug_next_split,
+        )
+        left, right = corner_segment_windows(
+            stroke,
+            int(i),
+            last_split=int(prev_split),
+            next_split=next_split,
+            min_pixels=min_pixels,
+            segment_arc=segment_arc,
+        )
+        segment_angle = pca_segment_axis_angle(left, right)
+        event["segment_angle"] = float(segment_angle)
+        event["segment_left_len"] = int(len(left))
+        event["segment_right_len"] = int(len(right))
+
+        if int(i) - int(prev_split) < min_pixels:
+            event["reject_reason"] = "near_previous_split"
+        elif next_split is None:
+            if len(stroke) - int(i) < min_pixels:
+                event["reject_reason"] = "right_segment_too_short"
+            elif len(left) < 2 or len(right) < 2:
+                event["reject_reason"] = "segment_window_too_short"
+            elif segment_angle < angle_thresh:
+                event["reject_reason"] = "segment_angle_below_threshold"
+            else:
+                event["high_score"] = True
+                event["reject_reason"] = "non_maximum_suppressed"
+        elif int(next_split) - int(i) < min_pixels:
+            event["reject_reason"] = "right_segment_too_short_before_next_split"
+        elif int(prev_split) > 0 and split_peak_min_distance > 0.0 and arc_distance_between_indices(int(i), int(prev_split)) < split_peak_min_distance:
+            event["reject_reason"] = "near_previous_split_distance"
+        elif next_split is not None and int(next_split) < len(stroke) - 1 and split_peak_min_distance > 0.0 and arc_distance_between_indices(int(i), int(next_split)) < split_peak_min_distance:
+            event["reject_reason"] = "near_next_split_distance"
+        elif len(left) < 2 or len(right) < 2:
+            event["reject_reason"] = "segment_window_too_short"
+        elif segment_angle < angle_thresh:
+            event["reject_reason"] = "segment_angle_below_threshold"
+        else:
+            event["high_score"] = True
+            event["reject_reason"] = "non_maximum_suppressed"
+        return event
+
+    def scan_candidates_for_selected_splits(selected_indices, pass_id=0, stage="rescan"):
+        round_scan_events = []
+        candidate_peaks = []
+        group_id = 0
+
+        def flush_group(group):
+            nonlocal group_id
+            if not group:
+                return
+            for peak in local_peaks_in_high_score_group(group):
+                peak["candidate"] = True
+                peak["local_max"] = True
+                peak["accepted"] = False
+                peak["reject_reason"] = "not_selected"
+                peak["candidate_group"] = int(group_id)
+                peak["raw_segment_angle"] = float(peak.get("segment_angle", 0.0))
+                peak["raw_segment_left_len"] = int(peak.get("segment_left_len", 0))
+                peak["raw_segment_right_len"] = int(peak.get("segment_right_len", 0))
+                candidate_peaks.append(dict(peak))
+            group_id += 1
+
+        for prev_split, next_split in split_segments(selected_indices):
+            group = []
+            for i in range(int(prev_split) + 1, int(next_split)):
+                event = scan_event_between_neighbors(
+                    i,
+                    prev_split,
+                    next_split,
+                    pass_id=pass_id,
+                    stage=stage,
+                )
+                round_scan_events.append(event)
+                if event.get("high_score", False):
+                    if group and int(event["index"]) == int(group[-1]["index"]) + 1:
+                        group.append(event)
+                    else:
+                        flush_group(group)
+                        group = [event]
+                else:
+                    flush_group(group)
+                    group = []
+            flush_group(group)
+
+        return round_scan_events, candidate_peaks
+
+    selected_indices = set()
+    final_evaluated = {}
+    seen_selected_sets = {tuple()}
+    max_opt_iters = split_optimize_max_iters
+
+    for pass_id in range(max_opt_iters):
+        old_indices = set(selected_indices)
+        round_scan_events, candidate_peaks = scan_candidates_for_selected_splits(
+            selected_indices,
+            pass_id=pass_id,
+            stage="rescan",
+        )
+        scan_events.extend(round_scan_events)
+
+        candidate_pool = {
+            int(event.get("index", 0)): dict(event)
+            for event in candidate_peaks
+        }
+        for split_i in selected_indices:
+            split_i = int(split_i)
+            if split_i not in candidate_pool and 0 < split_i < len(stroke) - 1:
+                carried = base_event_for_index(
+                    split_i,
+                    pass_id=pass_id,
+                    stage="carry_selected",
+                )
+                carried["candidate"] = True
+                carried["carried_split"] = True
+                carried["reject_reason"] = "carried_from_previous_pass"
+                candidate_pool[split_i] = carried
+
+        evaluated = {}
+        proposed_indices = set()
+        for split_i, event in sorted(candidate_pool.items()):
+            context_indices = set(selected_indices)
+            context_indices.discard(int(split_i))
+            updated, ok = evaluate_split_event_between_neighbors(
+                event,
+                context_indices,
+                pass_id=pass_id,
+                stage="evaluate",
             )
-        ]
-        fallback_peaks.sort(key=fallback_rank_key, reverse=True)
-        for fallback_peak in fallback_peaks:
-            if try_peak(fallback_peak):
-                break
+            evaluated[int(split_i)] = updated
+            if ok:
+                proposed_indices.add(int(split_i))
+
+        selected_indices = resolve_close_split_conflicts(proposed_indices, evaluated, pass_id)
+        final_evaluated = evaluated
+        for event in round_scan_events:
+            if not event.get("candidate", False):
+                continue
+            split_i = int(event.get("index", 0))
+            updated = evaluated.get(split_i)
+            if updated is None:
+                continue
+            event["accepted"] = bool(split_i in selected_indices and updated.get("accepted", False))
+            event["reject_reason"] = "" if event["accepted"] else updated.get("reject_reason", "")
+            event["segment_angle"] = float(updated.get("segment_angle", event.get("segment_angle", 0.0)))
+            event["segment_left_len"] = int(updated.get("segment_left_len", event.get("segment_left_len", 0)))
+            event["segment_right_len"] = int(updated.get("segment_right_len", event.get("segment_right_len", 0)))
+        selected_key = tuple(sorted(selected_indices))
+        if selected_indices == old_indices or selected_key in seen_selected_sets:
+            break
+        seen_selected_sets.add(selected_key)
+
+    final_scan_events, final_candidate_peaks = scan_candidates_for_selected_splits(
+        selected_indices,
+        pass_id=max_opt_iters,
+        stage="final_rescan",
+    )
+    scan_events.extend(final_scan_events)
+    final_pool = {
+        int(event.get("index", 0)): dict(event)
+        for event in final_candidate_peaks
+    }
+    for split_i in selected_indices:
+        split_i = int(split_i)
+        if split_i not in final_pool and 0 < split_i < len(stroke) - 1:
+            carried = base_event_for_index(
+                split_i,
+                pass_id=max_opt_iters,
+                stage="final_carry_selected",
+            )
+            carried["candidate"] = True
+            carried["carried_split"] = True
+            carried["reject_reason"] = "carried_from_previous_pass"
+            final_pool[split_i] = carried
+
+    final_evaluated = {}
+    for split_i, event in sorted(final_pool.items()):
+        context_indices = set(selected_indices)
+        context_indices.discard(int(split_i))
+        updated, _ok = evaluate_split_event_between_neighbors(
+            event,
+            context_indices,
+            pass_id=max_opt_iters,
+            stage="final",
+        )
+        final_evaluated[int(split_i)] = updated
+
+    split_events = []
+    for event in final_scan_events:
+        if not event.get("candidate", False):
+            continue
+        split_i = int(event.get("index", 0))
+        updated = final_evaluated.get(split_i)
+        if updated is None:
+            continue
+        event["accepted"] = bool(split_i in selected_indices and updated.get("accepted", False))
+        event["reject_reason"] = "" if event["accepted"] else updated.get("reject_reason", "")
+        event["segment_angle"] = float(updated.get("segment_angle", event.get("segment_angle", 0.0)))
+        event["segment_left_len"] = int(updated.get("segment_left_len", event.get("segment_left_len", 0)))
+        event["segment_right_len"] = int(updated.get("segment_right_len", event.get("segment_right_len", 0)))
+
+    for event in sorted(final_evaluated.values(), key=lambda e: int(e.get("index", 0))):
+        split_i = int(event.get("index", 0))
+        final_event = dict(event)
+        final_event["accepted"] = bool(split_i in selected_indices and final_event.get("accepted", False))
+        if split_i not in selected_indices:
+            final_event["accepted"] = False
+            if not final_event.get("reject_reason", ""):
+                final_event["reject_reason"] = "not_selected"
+        candidate_events.append(dict(final_event))
+        if bool(final_event.get("accepted", False)):
+            split_events.append(dict(final_event))
 
     if not split_events:
         return [stroke], [], candidate_events, scan_events
@@ -641,7 +888,7 @@ def split_stroke_at_corners_with_trace(stroke, angle_thresh=15.0, min_pixels=3, 
     return (pieces if pieces else [stroke]), split_events, candidate_events, scan_events
 
 
-def split_strokes_at_corners(strokes, angle_thresh=None, min_pixels=3, window=5, segment_arc=50.0):
+def split_strokes_at_corners(strokes, angle_thresh=None, min_pixels=3, window=5, segment_arc=50.0, split_peak_min_distance=10.0, split_optimize_max_iters=5):
     """Apply corner splitting to every traced stroke."""
     if angle_thresh is None:
         return strokes
@@ -655,12 +902,14 @@ def split_strokes_at_corners(strokes, angle_thresh=None, min_pixels=3, window=5,
                 min_pixels=min_pixels,
                 window=window,
                 segment_arc=segment_arc,
+                split_peak_min_distance=split_peak_min_distance,
+                split_optimize_max_iters=split_optimize_max_iters,
             )
         )
     return out
 
 
-def split_strokes_at_corners_with_trace(strokes, angle_thresh=None, min_pixels=3, window=5, segment_arc=50.0):
+def split_strokes_at_corners_with_trace(strokes, angle_thresh=None, min_pixels=3, window=5, segment_arc=50.0, split_peak_min_distance=10.0, split_optimize_max_iters=5):
     """Apply corner splitting and record input-to-output stroke mapping."""
     if angle_thresh is None:
         trace = []
@@ -686,6 +935,8 @@ def split_strokes_at_corners_with_trace(strokes, angle_thresh=None, min_pixels=3
             min_pixels=min_pixels,
             window=window,
             segment_arc=segment_arc,
+            split_peak_min_distance=split_peak_min_distance,
+            split_optimize_max_iters=split_optimize_max_iters,
         )
         output_indices = list(range(len(out), len(out) + len(pieces)))
         out.extend(pieces)
@@ -2931,11 +3182,12 @@ def draw_skeleton_nodes_debug(skel):
     return out
 
 
-def write_corner_split_trace_report(path, trace, angle_thresh=None):
+def write_corner_split_trace_report(path, trace, angle_thresh=None, peak_min_distance=None):
     """Write raw trace stroke to post-corner-split stroke mapping."""
     with open(path, "w", encoding="utf-8") as f:
         f.write("==== Corner Split Trace ====\n\n")
         f.write(f"split_corner_angle: {angle_thresh}\n")
+        f.write(f"split_peak_min_distance: {peak_min_distance}\n")
         f.write("Angles use folded unoriented axis angle: min(raw_angle, 180 - raw_angle).\n")
         f.write("output_indices are stroke ids after corner splitting, before optional merge.\n\n")
 
@@ -2964,12 +3216,14 @@ def write_corner_split_trace_report(path, trace, angle_thresh=None):
                 )
 
 
-def write_corner_split_candidates_report(path, trace, angle_thresh=None):
+def write_corner_split_candidates_report(path, trace, angle_thresh=None, peak_min_distance=None):
     """Write accepted and rejected corner split candidates."""
     with open(path, "w", encoding="utf-8") as f:
         f.write("==== Corner Split Candidates ====\n\n")
         f.write(f"split_corner_angle: {angle_thresh}\n")
+        f.write(f"split_peak_min_distance: {peak_min_distance}\n")
         f.write("Candidates are local maxima among adjacent points whose PCA segment_angle >= split_corner_angle.\n")
+        f.write("Multiple candidates inside one high-score run may be accepted when they are far enough apart.\n")
         f.write("folded_angle is the immediate-neighbor local angle and is reported only for debugging.\n\n")
 
         any_candidate = False
@@ -2987,6 +3241,14 @@ def write_corner_split_candidates_report(path, trace, angle_thresh=None):
                 p = event.get("point", (0.0, 0.0))
                 status = "ACCEPT" if event.get("accepted", False) else "reject"
                 reason = event.get("reject_reason", "")
+                opt_txt = ""
+                if "optimization_pass" in event:
+                    opt_txt = (
+                        f", opt_pass={event.get('optimization_pass')}, "
+                        f"opt_stage={event.get('optimization_stage', '')}, "
+                        f"prev={event.get('prev_split_index', None)}, "
+                        f"next={event.get('next_split_index', None)}"
+                    )
                 f.write(
                     f"  {status}: index={event.get('index', -1)}, "
                     f"point=({p[0]:.1f},{p[1]:.1f}), "
@@ -2995,19 +3257,20 @@ def write_corner_split_candidates_report(path, trace, angle_thresh=None):
                     f"segment_angle={event.get('segment_angle', 0.0):.2f}, "
                     f"segment_left_len={event.get('segment_left_len', 0)}, "
                     f"segment_right_len={event.get('segment_right_len', 0)}, "
-                    f"reason={reason}\n"
+                    f"reason={reason}{opt_txt}\n"
                 )
 
         if not any_candidate:
             f.write("No local-max corner candidates met the PCA segment_angle threshold.\n")
 
 
-def write_corner_split_scan_points_report(path, trace, angle_thresh=None):
+def write_corner_split_scan_points_report(path, trace, angle_thresh=None, peak_min_distance=None):
     """Write every point scanned while searching for corner split candidates."""
     with open(path, "w", encoding="utf-8") as f:
         f.write("==== Corner Split Scanned Points ====\n\n")
         f.write(f"split_corner_angle: {angle_thresh}\n")
-        f.write("Every listed point is an interior index visited by the corner-split scan.\n")
+        f.write(f"split_peak_min_distance: {peak_min_distance}\n")
+        f.write("Every listed point is an interior index visited by the corner-split scan; iterative rescans can list the same index in multiple passes.\n")
         f.write("candidate=True means the point survived segment_angle thresholding and local-maximum suppression.\n")
         f.write("folded_angle is an immediate-neighbor local angle for debugging only; segment_angle drives candidate selection.\n\n")
 
@@ -3019,6 +3282,7 @@ def write_corner_split_scan_points_report(path, trace, angle_thresh=None):
             any_scan = True
             candidates = [event for event in scans if event.get("candidate", False)]
             accepted = [event for event in scans if event.get("accepted", False)]
+            passes = sorted({event.get("optimization_pass", None) for event in scans})
             with_angle = [event for event in scans if event.get("raw_angle", 0.0) or event.get("folded_angle", 0.0)]
             with_segment = [event for event in scans if event.get("segment_angle", 0.0)]
             if with_angle:
@@ -3047,6 +3311,7 @@ def write_corner_split_scan_points_report(path, trace, angle_thresh=None):
                 f"input_len={item.get('input_len', 0)}, "
                 f"outputs={item.get('output_indices', [])}, "
                 f"scanned={len(scans)}, "
+                f"passes={passes}, "
                 f"candidates={len(candidates)}, "
                 f"accepted={len(accepted)}, "
                 f"{max_segment_text}, "
@@ -3069,6 +3334,10 @@ def write_corner_split_scan_points_report(path, trace, angle_thresh=None):
                     f"candidate={event.get('candidate', False)}, "
                     f"high_score={event.get('high_score', False)}, "
                     f"local_max={event.get('local_max', False)}, "
+                    f"pass={event.get('optimization_pass', None)}, "
+                    f"stage={event.get('optimization_stage', '')}, "
+                    f"prev={event.get('prev_split_index', None)}, "
+                    f"next={event.get('next_split_index', None)}, "
                     f"reason={event.get('reject_reason', '')}\n"
                 )
             f.write("\n")
@@ -5825,16 +6094,19 @@ def save_corner_split_debug_outputs(debug_dir, args, img_shape, corner_split_str
         os.path.join(debug_dir, "03c_corner_split_trace.txt"),
         corner_split_trace,
         angle_thresh=args.split_corner_angle,
+        peak_min_distance=args.split_peak_min_distance,
     )
     write_corner_split_candidates_report(
         os.path.join(debug_dir, "03d_corner_split_candidates.txt"),
         corner_split_trace,
         angle_thresh=args.split_corner_angle,
+        peak_min_distance=args.split_peak_min_distance,
     )
     write_corner_split_scan_points_report(
         os.path.join(debug_dir, "03d0_corner_split_scanned_points.txt"),
         corner_split_trace,
         angle_thresh=args.split_corner_angle,
+        peak_min_distance=args.split_peak_min_distance,
     )
     cv2.imwrite(
         os.path.join(debug_dir, "03d0_corner_split_scanned_points.png"),
@@ -5933,9 +6205,9 @@ def save_debug_outputs(debug_dir, args, img, bw, skel, pre_post_split_merge_stro
     cv2.imwrite(os.path.join(debug_dir, "02b_skeleton_nodes.png"), draw_skeleton_nodes_debug(skel))
     cv2.imwrite(os.path.join(debug_dir, "03a_raw_strokes.png"), draw_strokes_image(img.shape, raw_strokes, thickness=2, annotate=True))
     cv2.imwrite(os.path.join(debug_dir, "03a1_corner_split_before_post_merge.png"), draw_strokes_image(img.shape, pre_post_split_merge_strokes, thickness=2, annotate=True))
-    write_corner_split_trace_report(os.path.join(debug_dir, "03c_corner_split_trace.txt"), corner_split_trace, angle_thresh=args.split_corner_angle)
-    write_corner_split_candidates_report(os.path.join(debug_dir, "03d_corner_split_candidates.txt"), corner_split_trace, angle_thresh=args.split_corner_angle)
-    write_corner_split_scan_points_report(os.path.join(debug_dir, "03d0_corner_split_scanned_points.txt"), corner_split_trace, angle_thresh=args.split_corner_angle)
+    write_corner_split_trace_report(os.path.join(debug_dir, "03c_corner_split_trace.txt"), corner_split_trace, angle_thresh=args.split_corner_angle, peak_min_distance=args.split_peak_min_distance)
+    write_corner_split_candidates_report(os.path.join(debug_dir, "03d_corner_split_candidates.txt"), corner_split_trace, angle_thresh=args.split_corner_angle, peak_min_distance=args.split_peak_min_distance)
+    write_corner_split_scan_points_report(os.path.join(debug_dir, "03d0_corner_split_scanned_points.txt"), corner_split_trace, angle_thresh=args.split_corner_angle, peak_min_distance=args.split_peak_min_distance)
     cv2.imwrite(
         os.path.join(debug_dir, "03d0_corner_split_scanned_points.png"),
         draw_corner_split_scan_points_image(img.shape, corner_split_trace),
@@ -6036,6 +6308,10 @@ def main():
                         help="Accepted for command compatibility. Corner-based stroke splitting is not applied in this version.")
     parser.add_argument("--split-segment-arc", type=float, default=50.0,
                         help="Max arc length sampled on each side for PCA segment-angle validation in corner splitting.")
+    parser.add_argument("--split-peak-min-distance", type=float, default=10.0,
+                        help="Minimum stroke-arc pixel distance between multiple accepted corner split peaks.")
+    parser.add_argument("--split-optimize-max-iters", type=int, default=5,
+                        help="Maximum optimization iterations for selecting corner split candidates.")
     parser.add_argument("--split-segment-window", type=int, default=None,
                         help="Deprecated compatibility option; use --split-segment-arc instead.")
     parser.add_argument("--disable-post-split-merge", action="store_true",
@@ -6122,6 +6398,8 @@ def main():
         angle_thresh=args.split_corner_angle,
         min_pixels=args.trace_min_pixels,
         segment_arc=args.split_segment_arc,
+        split_peak_min_distance=args.split_peak_min_distance,
+        split_optimize_max_iters=args.split_optimize_max_iters,
     )
     pre_post_split_merge_strokes = [s.copy() for s in raw_strokes]
     save_corner_split_debug_outputs(
