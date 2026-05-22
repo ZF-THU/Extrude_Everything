@@ -522,16 +522,29 @@ def split_stroke_at_corners_with_trace(stroke, angle_thresh=15.0, min_pixels=3, 
         else:
             groups[-1].append(event)
 
-    last_split = 0
-    for group in groups:
-        peak = max(
-            group,
-            key=lambda event: (
-                float(event.get("segment_angle", 0.0)),
-                float(event.get("folded_angle", 0.0)),
-                -int(event.get("index", 0)),
-            ),
+    def peak_rank_key(event):
+        return (
+            float(event.get("segment_angle", 0.0)),
+            float(event.get("folded_angle", 0.0)),
+            -int(event.get("index", 0)),
         )
+
+    def local_peaks_in_high_score_group(group):
+        if len(group) <= 1:
+            return list(group)
+        peaks = []
+        for j, event in enumerate(group):
+            score = float(event.get("segment_angle", 0.0))
+            left_score = float(group[j - 1].get("segment_angle", 0.0)) if j > 0 else None
+            right_score = float(group[j + 1].get("segment_angle", 0.0)) if j + 1 < len(group) else None
+            if (left_score is None or score >= left_score) and (right_score is None or score >= right_score):
+                peaks.append(event)
+        return peaks if peaks else [max(group, key=peak_rank_key)]
+
+    last_split = 0
+
+    def try_peak(peak):
+        nonlocal last_split
         peak["candidate"] = True
         peak["local_max"] = True
 
@@ -570,6 +583,44 @@ def split_stroke_at_corners_with_trace(stroke, angle_thresh=15.0, min_pixels=3, 
                 last_split = split_i
 
         candidate_events.append(dict(peak))
+        return bool(peak.get("accepted", False))
+
+    def fallback_rank_key(event):
+        support = min(
+            int(event.get("segment_left_len", 0)),
+            int(event.get("segment_right_len", 0)),
+        )
+        return (
+            support,
+            float(event.get("segment_angle", 0.0)),
+            float(event.get("folded_angle", 0.0)),
+            -int(event.get("index", 0)),
+        )
+
+    for group in groups:
+        # Preserve the original behavior when the strongest local peak is a
+        # legal split. If that peak is only a boundary spike, fall back to an
+        # interior local peak instead of suppressing the whole high-score run.
+        peaks = local_peaks_in_high_score_group(group)
+        peak = max(peaks, key=peak_rank_key)
+        if try_peak(peak):
+            continue
+
+        if peak.get("reject_reason", "") not in ("near_previous_split", "right_segment_too_short"):
+            continue
+
+        fallback_peaks = [
+            p for p in peaks
+            if (
+                p is not peak
+                and int(p.get("index", 0)) - last_split >= min_pixels
+                and len(stroke) - int(p.get("index", 0)) >= min_pixels
+            )
+        ]
+        fallback_peaks.sort(key=fallback_rank_key, reverse=True)
+        for fallback_peak in fallback_peaks:
+            if try_peak(fallback_peak):
+                break
 
     if not split_events:
         return [stroke], [], candidate_events, scan_events
