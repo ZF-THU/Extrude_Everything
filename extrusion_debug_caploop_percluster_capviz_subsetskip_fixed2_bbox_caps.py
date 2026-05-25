@@ -2139,9 +2139,21 @@ def point_inside_bbox(p, bbox):
     return x0 <= p[0] <= x1 and y0 <= p[1] <= y1
 
 
+def filter_side_direction_group_strokes(stroke_infos, min_length, min_straightness):
+    """Return strokes eligible for side-direction clustering."""
+    return [
+        s for s in stroke_infos
+        if s["arc"] >= min_length and s["straightness"] >= min_straightness
+    ]
+
+
 def choose_extrusion_model(args, infos, img_shape, skel):
     line_strokes = [s for s in infos if s["arc"] >= args.min_stroke_length and s["straightness"] >= args.straightness]
-    direction_group_strokes = [s for s in infos if s["arc"] >= args.min_stroke_length]
+    direction_group_strokes = filter_side_direction_group_strokes(
+        infos,
+        min_length=args.min_stroke_length,
+        min_straightness=args.side_straightness,
+    )
 
     if args.force_parallel:
         return fallback_parallel_direction(
@@ -2517,9 +2529,17 @@ def endpoint_connection_degree_in_component(strokes, comp, stroke_local_i, endpo
     Count the nearest-neighbor endpoint connection for one endpoint in a component.
 
     Each endpoint can contribute at most one connection: its nearest other
-    endpoint within endpoint_tol.  If that nearest endpoint is outside this
-    component, the degree is treated as 0 for this component.
+    endpoint within endpoint_tol.  The nearest-neighbor search is recomputed
+    inside the current component, so pruning an open branch can expose the next
+    nearest endpoint and preserve a valid closed sub-loop.
     """
+    comp = [int(i) for i in comp]
+    stroke_local_i = int(stroke_local_i)
+    endpoint_i = int(endpoint_i)
+    comp_set = set(comp)
+    if stroke_local_i not in comp_set:
+        return 0, []
+
     if len(comp) == 1:
         p0, p1 = stroke_endpoint_points(strokes[stroke_local_i])
         if endpoint_i == 0 and endpoint_points_close(p0, p1, endpoint_tol):
@@ -2528,13 +2548,15 @@ def endpoint_connection_degree_in_component(strokes, comp, stroke_local_i, endpo
             return 1, [(int(strokes[stroke_local_i]["index"]), 0)]
         return 0, []
 
-    nearest_matches = build_nearest_endpoint_matches(strokes, endpoint_tol=endpoint_tol)
-    match = nearest_matches.get((int(stroke_local_i), int(endpoint_i)), None)
+    global_to_component_i = {global_i: component_i for component_i, global_i in enumerate(comp)}
+    component_i = global_to_component_i[stroke_local_i]
+    component_strokes = [strokes[global_i] for global_i in comp]
+    nearest_matches = build_nearest_endpoint_matches(component_strokes, endpoint_tol=endpoint_tol)
+    match = nearest_matches.get((component_i, endpoint_i), None)
     if match is None:
         return 0, []
-    if match[0] not in set(comp):
-        return 0, []
-    return 1, [(int(strokes[match[0]]["index"]), int(match[1]))]
+    matched_global_i = comp[int(match[0])]
+    return 1, [(int(strokes[matched_global_i]["index"]), int(match[1]))]
 
 
 def is_closed_stroke_component_by_endpoint_proximity(strokes, comp, endpoint_tol=12.0):
@@ -2654,6 +2676,84 @@ def remove_post_loop_self_loops(strokes, comp, endpoint_tol=12.0):
     return current, removed
 
 
+def normalize_cap_loop_component(strokes, comp, endpoint_tol=12.0):
+    """
+    Alternate open-branch pruning and self-loop removal until the component stabilizes.
+
+    Removing a self-loop can expose new open ends, so one prune pass is not enough.
+    This helper keeps iterating until neither phase removes any more strokes.
+    """
+    current = sorted(set(int(i) for i in comp))
+    removed_open_local = []
+    removed_self_local = []
+    trace = []
+
+    while current:
+        pruned_comp, removed_branch = prune_open_branches_from_component(
+            strokes,
+            current,
+            endpoint_tol=endpoint_tol,
+        )
+        current = list(map(int, pruned_comp))
+        removed_branch = list(map(int, removed_branch))
+        if removed_branch:
+            removed_open_local.extend(removed_branch)
+
+        closed_after_prune = bool(current) and is_closed_stroke_component_by_endpoint_proximity(
+            strokes,
+            current,
+            endpoint_tol=endpoint_tol,
+        )
+        trace.append({
+            "phase": "prune_open_branches",
+            "remaining_strokes": [int(strokes[i]["index"]) for i in current],
+            "removed_open_branch_strokes": [int(strokes[i]["index"]) for i in removed_branch],
+            "closed": bool(closed_after_prune),
+        })
+        if not current or not closed_after_prune:
+            break
+
+        post_loop_comp, removed_self_loops = remove_post_loop_self_loops(
+            strokes,
+            current,
+            endpoint_tol=endpoint_tol,
+        )
+        current = list(map(int, post_loop_comp))
+        removed_self_loops = list(map(int, removed_self_loops))
+        if removed_self_loops:
+            removed_self_local.extend(removed_self_loops)
+
+        closed_after_self_loop = bool(current) and is_closed_stroke_component_by_endpoint_proximity(
+            strokes,
+            current,
+            endpoint_tol=endpoint_tol,
+        )
+        trace.append({
+            "phase": "remove_post_loop_self_loops",
+            "remaining_strokes": [int(strokes[i]["index"]) for i in current],
+            "removed_post_loop_self_strokes": [int(strokes[i]["index"]) for i in removed_self_loops],
+            "closed": bool(closed_after_self_loop),
+        })
+        if not removed_self_loops:
+            break
+
+    final_closed = bool(current) and is_closed_stroke_component_by_endpoint_proximity(
+        strokes,
+        current,
+        endpoint_tol=endpoint_tol,
+    )
+    return {
+        "component_local_indices": list(map(int, current)),
+        "component_stroke_indices": [int(strokes[i]["index"]) for i in current],
+        "closed": bool(final_closed),
+        "removed_open_branch_local_indices": removed_open_local,
+        "removed_open_branch_strokes": [int(strokes[i]["index"]) for i in removed_open_local],
+        "removed_post_loop_self_local_indices": removed_self_local,
+        "removed_post_loop_self_strokes": [int(strokes[i]["index"]) for i in removed_self_local],
+        "trace": trace,
+    }
+
+
 def is_closed_stroke_graph(comp, endpoint_nodes):
     """
     Strict closed-loop test.
@@ -2685,6 +2785,9 @@ def candidate_from_stroke_loop(shape, strokes, comp, thickness=2):
     mask = make_stroke_mask(shape, loop_strokes, thickness=thickness)
     enclosed_area, enclosed_mask = estimate_enclosed_area_from_loop_mask(mask)
     pts = np.vstack([s["points"] for s in loop_strokes])
+    cap_pixels_mask = ((mask > 0) | (enclosed_mask > 0)).astype(np.uint8)
+    ys, xs = np.where(cap_pixels_mask > 0)
+    bbox_meta = bbox_for_points(list(zip(xs.tolist(), ys.tolist())))
     center = pts.mean(axis=0).astype(np.float64)
     area = int(np.count_nonzero(mask))
     total_arc = float(sum(s["arc"] for s in loop_strokes))
@@ -2693,6 +2796,8 @@ def candidate_from_stroke_loop(shape, strokes, comp, thickness=2):
         "enclosed_mask": enclosed_mask,
         "area": area,
         "enclosed_area": int(enclosed_area),
+        "bbox": None if bbox_meta is None else bbox_meta.get("bbox"),
+        "bbox_area": 0 if bbox_meta is None else int(bbox_meta.get("bbox_area", 0)),
         "endpoints": 0,
         "closedness": 1.0,
         "score": float(enclosed_area + area + total_arc),
@@ -2788,6 +2893,7 @@ def extract_cap_loop_candidates_from_strokes(
     endpoint_tol=12.0,
     min_pixels=40,
     min_enclosed_area=0,
+    min_bbox_area=0,
     min_total_arc=0.0,
     thickness=2,
     max_loop_subset_size=14,
@@ -2821,30 +2927,16 @@ def extract_cap_loop_candidates_from_strokes(
     seen = set()
 
     for comp in comps:
-        pruned_comp, removed_branch = prune_open_branches_from_component(
+        normalized = normalize_cap_loop_component(
             non_side_infos,
             comp,
             endpoint_tol=endpoint_tol,
         )
-        if not pruned_comp:
+        final_comp = list(map(int, normalized["component_local_indices"]))
+        if not final_comp:
             continue
-        if not is_closed_stroke_component_by_endpoint_proximity(non_side_infos, pruned_comp, endpoint_tol=endpoint_tol):
+        if not normalized.get("closed", False):
             continue
-        post_loop_comp, removed_self_loops = remove_post_loop_self_loops(
-            non_side_infos,
-            pruned_comp,
-            endpoint_tol=endpoint_tol,
-        )
-        if not post_loop_comp:
-            continue
-        if removed_self_loops:
-            if not is_closed_stroke_component_by_endpoint_proximity(
-                non_side_infos,
-                post_loop_comp,
-                endpoint_tol=endpoint_tol,
-            ):
-                continue
-        final_comp = list(map(int, post_loop_comp))
 
         key = tuple(sorted(int(non_side_infos[i]["index"]) for i in final_comp))
         if key in seen:
@@ -2856,15 +2948,22 @@ def extract_cap_loop_candidates_from_strokes(
             continue
         if cand.get("enclosed_area", 0) < min_enclosed_area:
             continue
+        if cand.get("bbox_area", 0) < min_bbox_area:
+            continue
         if cand.get("total_arc", 0.0) < min_total_arc:
             continue
-        if removed_self_loops:
+        removed_branch = normalized.get("removed_open_branch_strokes", [])
+        removed_self_loops = normalized.get("removed_post_loop_self_strokes", [])
+        if removed_self_loops and removed_branch:
+            cand["loop_detection"] = "component_iterative_prune_and_self_loop_removal"
+        elif removed_self_loops:
             cand["loop_detection"] = "component_postloop_self_loop_removed"
         else:
             cand["loop_detection"] = "component_pruned_open_branches" if removed_branch else "component"
         cand["component_local_indices"] = list(map(int, final_comp))
-        cand["pruned_branch_strokes"] = [int(non_side_infos[i]["index"]) for i in removed_branch]
-        cand["removed_post_loop_self_strokes"] = [int(non_side_infos[i]["index"]) for i in removed_self_loops]
+        cand["component_normalization_trace"] = list(normalized.get("trace", []))
+        cand["pruned_branch_strokes"] = list(removed_branch)
+        cand["removed_post_loop_self_strokes"] = list(removed_self_loops)
         candidates.append(cand)
 
     candidates.sort(key=lambda c: (c.get("enclosed_area", 0), c["score"]), reverse=True)
@@ -2924,6 +3023,8 @@ def init_cap_validation_details(entry, rank):
     details["best_cap_score"] = 0.0
     details["best_cap_area"] = 0
     details["best_cap_enclosed_area"] = 0
+    details["best_cap_bbox"] = None
+    details["best_cap_bbox_area"] = 0
     details["best_cap_center"] = None
     details["best_cap_total_arc"] = 0.0
     details["invalid_no_cap"] = False
@@ -2957,6 +3058,8 @@ def fill_best_cap_details(details, best_cap, candidate_count):
     details["best_cap_score"] = float(best_cap.get("score", 0.0))
     details["best_cap_area"] = int(best_cap.get("area", 0))
     details["best_cap_enclosed_area"] = int(best_cap.get("enclosed_area", 0))
+    details["best_cap_bbox"] = best_cap.get("bbox", None)
+    details["best_cap_bbox_area"] = int(best_cap.get("bbox_area", 0))
     details["best_cap_center"] = center_tuple
     details["best_cap_total_arc"] = float(best_cap.get("total_arc", 0.0))
 
@@ -2999,6 +3102,7 @@ def compute_best_cap_for_side_entry(
     endpoint_tol=12.0,
     min_pixels=40,
     min_enclosed_area=0,
+    min_bbox_area=0,
     min_total_arc=0.0,
     thickness=2,
     max_loop_subset_size=14,
@@ -3013,6 +3117,7 @@ def compute_best_cap_for_side_entry(
         endpoint_tol=endpoint_tol,
         min_pixels=min_pixels,
         min_enclosed_area=min_enclosed_area,
+        min_bbox_area=min_bbox_area,
         min_total_arc=min_total_arc,
         thickness=thickness,
         max_loop_subset_size=max_loop_subset_size,
@@ -3027,6 +3132,7 @@ def validate_side_clusters_by_cap_candidates(
     endpoint_tol=12.0,
     min_pixels=40,
     min_enclosed_area=0,
+    min_bbox_area=0,
     min_total_arc=0.0,
     thickness=2,
     max_loop_subset_size=14,
@@ -3060,6 +3166,7 @@ def validate_side_clusters_by_cap_candidates(
             endpoint_tol=endpoint_tol,
             min_pixels=min_pixels,
             min_enclosed_area=min_enclosed_area,
+            min_bbox_area=min_bbox_area,
             min_total_arc=min_total_arc,
             thickness=thickness,
             max_loop_subset_size=max_loop_subset_size,
@@ -3094,6 +3201,7 @@ def validate_side_clusters_by_cap_candidates(
                 endpoint_tol=endpoint_tol,
                 min_pixels=min_pixels,
                 min_enclosed_area=min_enclosed_area,
+                min_bbox_area=min_bbox_area,
                 min_total_arc=min_total_arc,
                 thickness=thickness,
                 max_loop_subset_size=max_loop_subset_size,
@@ -3118,6 +3226,7 @@ def validate_side_clusters_by_cap_candidates(
             "cap_candidate_count": int(details.get("cap_candidate_count", 0)),
             "best_cap_area": int(details.get("best_cap_area", 0)),
             "best_cap_enclosed_area": int(details.get("best_cap_enclosed_area", 0)),
+            "best_cap_bbox_area": int(details.get("best_cap_bbox_area", 0)),
             "best_cap_total_arc": float(details.get("best_cap_total_arc", 0.0)),
             "best_cap_score": float(details.get("best_cap_score", 0.0)),
             "best_cap_strokes": list(details.get("best_cap_strokes", [])),
@@ -4353,13 +4462,15 @@ def direction_group_center(group):
     return np.mean(centers, axis=0)
 
 
-def write_direction_groups_debug_report(path, strokes, angle_thresh=25.0, min_stroke_length=None):
-    """Write length-filtered direction groups produced by unoriented angle similarity."""
+def write_direction_groups_debug_report(path, strokes, angle_thresh=25.0, min_stroke_length=None, min_straightness=None):
+    """Write side-prefiltered direction groups produced by unoriented angle similarity."""
     groups = build_direction_clusters(strokes, angle_thresh=angle_thresh)
     with open(path, "w", encoding="utf-8") as f:
-        f.write("==== Length-filtered Stroke Direction Groups ====\n\n")
+        f.write("==== Side-Prefiltered Stroke Direction Groups ====\n\n")
         if min_stroke_length is not None:
             f.write(f"min_stroke_length: {float(min_stroke_length):.2f}\n")
+        if min_straightness is not None:
+            f.write(f"side_straightness: {float(min_straightness):.2f}\n")
         f.write(f"angle_thresh: {angle_thresh:.2f}\n")
         f.write("Grouping rule: strokes are connected when unoriented PCA angle <= threshold.\n")
         f.write("Same direction and opposite direction are treated as the same axis.\n\n")
@@ -4384,8 +4495,8 @@ def write_direction_groups_debug_report(path, strokes, angle_thresh=25.0, min_st
                 )
 
 
-def draw_direction_groups_image(shape, strokes, angle_thresh=25.0, thickness=4, min_stroke_length=None):
-    """Draw length-filtered direction groups with distinct colors and group angles."""
+def draw_direction_groups_image(shape, strokes, angle_thresh=25.0, thickness=4, min_stroke_length=None, min_straightness=None):
+    """Draw side-prefiltered direction groups with distinct colors and group angles."""
     h, w = shape[:2]
     out = np.full((h, w, 3), 255, dtype=np.uint8)
     groups = build_direction_clusters(strokes, angle_thresh=angle_thresh)
@@ -4423,7 +4534,7 @@ def draw_direction_groups_image(shape, strokes, angle_thresh=25.0, thickness=4, 
 
     cv2.putText(
         out,
-        f"Length-filtered direction groups, threshold={angle_thresh:.1f} deg",
+        f"Side-prefiltered direction groups, threshold={angle_thresh:.1f} deg",
         (15, 25),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.62,
@@ -4446,6 +4557,17 @@ def draw_direction_groups_image(shape, strokes, angle_thresh=25.0, thickness=4, 
             out,
             f"Only strokes with arc >= {float(min_stroke_length):.1f} are grouped",
             (15, 75),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+    if min_straightness is not None:
+        cv2.putText(
+            out,
+            f"Only strokes with straightness >= {float(min_straightness):.2f} are grouped for side clustering",
+            (15, 100),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.52,
             (0, 0, 0),
@@ -4595,6 +4717,7 @@ def format_cluster_debug_entry(entry, selected_cluster_id=None):
             f"cap_count={details.get('cap_candidate_count', 0)}, "
             f"best_cap_area={details.get('best_cap_area', 0)}, "
             f"best_cap_enclosed={details.get('best_cap_enclosed_area', 0)}, "
+            f"best_cap_bbox_area={details.get('best_cap_bbox_area', 0)}, "
             f"best_cap_strokes={details.get('best_cap_strokes', [])}, "
         f"invalid_no_cap={details.get('invalid_no_cap', False)}, "
         f"cap_selected={details.get('selected_by_cap_validation', False)}, "
@@ -4638,13 +4761,14 @@ def write_cluster_debug_report(path, model):
                 f.write(f"    connected_pairs={details.get('connected_pairs', [])} -> REJECTED_CLUSTER\n")
             if details.get("cap_validation_checked", False):
                 f.write(
-                    f"    cap_validation: total_candidates={details.get('cap_candidate_count', 0)}, "
-                    f"best_area={details.get('best_cap_area', 0)}, "
-                    f"best_enclosed_area={details.get('best_cap_enclosed_area', 0)}, "
-                    f"best_strokes={details.get('best_cap_strokes', [])}, "
-                    f"best_score={details.get('best_cap_score', 0.0):.1f}, "
-                    f"best_center={details.get('best_cap_center', None)}, "
-                    f"best_total_arc={details.get('best_cap_total_arc', 0.0):.1f}, "
+                f"    cap_validation: total_candidates={details.get('cap_candidate_count', 0)}, "
+                f"best_area={details.get('best_cap_area', 0)}, "
+                f"best_enclosed_area={details.get('best_cap_enclosed_area', 0)}, "
+                f"best_bbox_area={details.get('best_cap_bbox_area', 0)}, "
+                f"best_strokes={details.get('best_cap_strokes', [])}, "
+                f"best_score={details.get('best_cap_score', 0.0):.1f}, "
+                f"best_center={details.get('best_cap_center', None)}, "
+                f"best_total_arc={details.get('best_cap_total_arc', 0.0):.1f}, "
                     f"invalid_no_cap={details.get('invalid_no_cap', False)}, "
                     f"selectable={details.get('cap_validation_selectable', True)}, "
                     f"selected={details.get('selected_by_cap_validation', False)}\n"
@@ -4695,6 +4819,7 @@ def write_cap_search_trace_report(path, model):
                 f"cap_count={int(item.get('cap_candidate_count', 0))}, "
                 f"best_area={int(item.get('best_cap_area', 0))}, "
                 f"best_enclosed_area={int(item.get('best_cap_enclosed_area', 0))}, "
+                f"best_bbox_area={int(item.get('best_cap_bbox_area', 0))}, "
                 f"best_total_arc={float(item.get('best_cap_total_arc', 0.0)):.1f}, "
                 f"best_score={float(item.get('best_cap_score', 0.0)):.1f}, "
                 f"best_cap_strokes={item.get('best_cap_strokes', [])}\n"
@@ -5361,6 +5486,9 @@ def draw_cap_endpoint_graph_image(shape, entry, cap_pool_infos, endpoint_tol=12.
         closed = is_closed_stroke_component_by_endpoint_proximity(non_side_infos, comp, endpoint_tol=endpoint_tol)
         pruned_comp, removed_branch = prune_open_branches_from_component(non_side_infos, comp, endpoint_tol=endpoint_tol)
         pruned_closed = is_closed_stroke_component_by_endpoint_proximity(non_side_infos, pruned_comp, endpoint_tol=endpoint_tol)
+        normalized = normalize_cap_loop_component(non_side_infos, comp, endpoint_tol=endpoint_tol)
+        normalized_closed = bool(normalized.get("closed", False))
+        normalized_comp = normalized.get("component_local_indices", [])
         for li in comp:
             s = non_side_infos[li]
             pts = s["points"].reshape(-1, 1, 2).astype(np.int32)
@@ -5377,7 +5505,8 @@ def draw_cap_endpoint_graph_image(shape, entry, cap_pool_infos, endpoint_tol=12.
             label_pos = np.mean(np.asarray(all_pts), axis=0)
             status = "closed" if closed else "open"
             pruned_status = "closed" if pruned_closed else "open"
-            cv2.putText(out, f"comp {ci}: {status}, prune={pruned_status}, n={len(pruned_comp)}/{len(comp)}",
+            normalized_status = "closed" if normalized_closed else "open"
+            cv2.putText(out, f"comp {ci}: {status}, prune={pruned_status}, norm={normalized_status}, n={len(normalized_comp)}/{len(comp)}",
                         (int(label_pos[0]) + 8, int(label_pos[1]) - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA)
 
@@ -5476,10 +5605,18 @@ def save_cap_endpoint_graph_debug_outputs(debug_dir, img_shape, model, infos, ar
                     pruned_comp,
                     endpoint_tol=args.cap_loop_endpoint_tol,
                 )
+                normalized = normalize_cap_loop_component(
+                    non_side_infos,
+                    comp,
+                    endpoint_tol=args.cap_loop_endpoint_tol,
+                )
                 f.write(
                     f"  component {ci:03d}: closed={closed}, strokes={gids}, "
                     f"pruned_closed={pruned_closed}, pruned_strokes={pruned_gids}, "
-                    f"removed_open_branch_strokes={removed_gids}\n"
+                    f"removed_open_branch_strokes={removed_gids}, "
+                    f"normalized_closed={bool(normalized.get('closed', False))}, "
+                    f"normalized_strokes={normalized.get('component_stroke_indices', [])}, "
+                    f"removed_post_loop_self_strokes={normalized.get('removed_post_loop_self_strokes', [])}\n"
                 )
                 for li in comp:
                     sid = int(non_side_infos[li]["index"])
@@ -6155,6 +6292,7 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
                     endpoint_tol=args.cap_loop_endpoint_tol,
                     min_pixels=args.min_cap_pixels,
                     min_enclosed_area=args.min_cap_enclosed_area,
+                    min_bbox_area=args.min_cap_bbox_area,
                     min_total_arc=args.min_cap_total_arc,
                     thickness=args.cap_loop_thickness,
                     max_loop_subset_size=args.cap_loop_max_subset_size,
@@ -6266,6 +6404,7 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
                     f"rank {rank:02d} cluster {cluster_id:02d} selected={selected} "
                     f"side={entry.get('indices', [])} best_cap_strokes={cap_candidate.get('stroke_indices', [])} "
                     f"best_cap_area={cap_candidate.get('area', 0)} best_cap_enclosed_area={cap_candidate.get('enclosed_area', 0)} "
+                    f"best_cap_bbox_area={cap_candidate.get('bbox_area', 0)} best_cap_bbox={cap_candidate.get('bbox', None)} "
                     f"best_cap_total_arc={cap_candidate.get('total_arc', 0.0):.1f} "
                     f"best_cap_score={cap_candidate.get('score', 0.0):.1f} "
                     f"removed_post_loop_self_strokes={cap_candidate.get('removed_post_loop_self_strokes', [])} "
@@ -6860,12 +6999,17 @@ def save_stroke_info_debug_outputs(debug_dir, args, img_shape, infos, line_strok
     write_stroke_direction_debug_json(os.path.join(debug_dir, "05a_stroke_directions.json"), infos, line_strokes)
     cv2.imwrite(os.path.join(debug_dir, "05a_stroke_directions.png"), draw_stroke_directions_image(img_shape, infos, line_strokes))
 
-    direction_group_strokes = [s for s in infos if s["arc"] >= args.min_stroke_length]
+    direction_group_strokes = filter_side_direction_group_strokes(
+        infos,
+        min_length=args.min_stroke_length,
+        min_straightness=args.side_straightness,
+    )
     write_direction_groups_debug_report(
         os.path.join(debug_dir, "05c_all_stroke_direction_groups.txt"),
         direction_group_strokes,
         angle_thresh=args.parallel_angle_thresh,
         min_stroke_length=args.min_stroke_length,
+        min_straightness=args.side_straightness,
     )
     cv2.imwrite(
         os.path.join(debug_dir, "05c_all_stroke_direction_groups.png"),
@@ -6874,6 +7018,7 @@ def save_stroke_info_debug_outputs(debug_dir, args, img_shape, infos, line_strok
             direction_group_strokes,
             angle_thresh=args.parallel_angle_thresh,
             min_stroke_length=args.min_stroke_length,
+            min_straightness=args.side_straightness,
         ),
     )
 
@@ -6933,12 +7078,17 @@ def save_debug_outputs(debug_dir, args, img, bw, skel, pre_post_split_merge_stro
     write_stroke_direction_debug_report(os.path.join(debug_dir, "05a_stroke_directions.txt"), infos, line_strokes)
     write_stroke_direction_debug_json(os.path.join(debug_dir, "05a_stroke_directions.json"), infos, line_strokes)
     cv2.imwrite(os.path.join(debug_dir, "05a_stroke_directions.png"), draw_stroke_directions_image(img.shape, infos, line_strokes))
-    direction_group_strokes = [s for s in infos if s["arc"] >= args.min_stroke_length]
+    direction_group_strokes = filter_side_direction_group_strokes(
+        infos,
+        min_length=args.min_stroke_length,
+        min_straightness=args.side_straightness,
+    )
     write_direction_groups_debug_report(
         os.path.join(debug_dir, "05c_all_stroke_direction_groups.txt"),
         direction_group_strokes,
         angle_thresh=args.parallel_angle_thresh,
         min_stroke_length=args.min_stroke_length,
+        min_straightness=args.side_straightness,
     )
     cv2.imwrite(
         os.path.join(debug_dir, "05c_all_stroke_direction_groups.png"),
@@ -6947,6 +7097,7 @@ def save_debug_outputs(debug_dir, args, img, bw, skel, pre_post_split_merge_stro
             direction_group_strokes,
             angle_thresh=args.parallel_angle_thresh,
             min_stroke_length=args.min_stroke_length,
+            min_straightness=args.side_straightness,
         ),
     )
     save_cluster_debug_outputs(debug_dir, img.shape, model)
@@ -7037,6 +7188,12 @@ def main():
 
     parser.add_argument("--min-stroke-length", type=float, default=30)
     parser.add_argument("--straightness", type=float, default=0.88)
+    parser.add_argument(
+        "--side-straightness",
+        type=float,
+        default=0.85,
+        help="Hard prefilter for side-stroke clustering. Only strokes with straightness >= this value enter PCA direction grouping for side selection.",
+    )
     parser.add_argument("--dist-thresh", type=float, default=8.0)
     parser.add_argument("--angle-thresh", type=float, default=12.0)
     parser.add_argument("--vp", nargs=2, type=float, default=None)
@@ -7080,6 +7237,8 @@ def main():
     parser.add_argument("--min-cap-pixels", type=int, default=40)
     parser.add_argument("--min-cap-enclosed-area", type=int, default=0,
                         help="Reject cap candidates whose estimated filled/enclosed area is smaller than this value.")
+    parser.add_argument("--min-cap-bbox-area", type=int, default=0,
+                        help="Reject cap candidates whose cap bbox area is smaller than this value. The bbox is computed on loop pixels union enclosed cap pixels.")
     parser.add_argument("--min-cap-total-arc", type=float, default=0.0,
                         help="Reject cap candidates whose total stroke arc length is smaller than this value.")
     parser.add_argument("--cap-loop-endpoint-tol", type=float, default=12.0,
@@ -7189,7 +7348,7 @@ def main():
 
     if model is None:
         raise RuntimeError(
-            "Could not estimate extrusion direction. Try --force-parallel, lower --straightness, "
+            "Could not estimate extrusion direction. Try --force-parallel, lower --side-straightness, lower --straightness, "
             "lower --min-stroke-length, increase --merge-gap, or provide --vp manually."
         )
     if len(model["inliers"]) == 0:
@@ -7207,6 +7366,7 @@ def main():
         endpoint_tol=args.cap_loop_endpoint_tol,
         min_pixels=args.min_cap_pixels,
         min_enclosed_area=args.min_cap_enclosed_area,
+        min_bbox_area=args.min_cap_bbox_area,
         min_total_arc=args.min_cap_total_arc,
         thickness=args.cap_loop_thickness,
         max_loop_subset_size=args.cap_loop_max_subset_size,

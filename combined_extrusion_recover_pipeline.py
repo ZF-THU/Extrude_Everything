@@ -44,6 +44,12 @@ def main():
     )
     parser.add_argument("--trace-min-pixels", type=int, default=3)
     parser.add_argument("--straightness", type=float, default=0.65)
+    parser.add_argument(
+        "--side-straightness",
+        type=float,
+        default=0.85,
+        help="Forwarded to the extrusion script. Hard prefilter for side-stroke clustering before PCA direction grouping.",
+    )
     parser.add_argument("--min-stroke-length", type=float, default=25)
     parser.add_argument("--parallel-angle-thresh", type=float, default=15)
     parser.add_argument(
@@ -63,6 +69,12 @@ def main():
     parser.add_argument("--post-split-merge-protect-junction-radius", type=float, default=3)
     parser.add_argument("--cap-loop-max-subset-size", type=int, default=15)
     parser.add_argument("--same-loop-endpoint-tol", type=float, default=5)
+    parser.add_argument(
+        "--min-cap-bbox-area",
+        type=int,
+        default=0,
+        help="Forwarded to the extrusion script. Reject cap candidates whose bbox area is below this threshold.",
+    )
     parser.add_argument("--min-cap-total-arc", type=float, default=50)
     parser.add_argument("--split-segment-arc", type=float, default=30)
     parser.add_argument("--split-peak-min-distance", type=float, default=10)
@@ -177,6 +189,8 @@ def main():
             str(args.trace_min_pixels),
             "--straightness",
             str(args.straightness),
+            "--side-straightness",
+            str(args.side_straightness),
             "--min-stroke-length",
             str(args.min_stroke_length),
             "--parallel-angle-thresh",
@@ -195,6 +209,8 @@ def main():
             str(args.cap_loop_max_subset_size),
             "--same-loop-endpoint-tol",
             str(args.same_loop_endpoint_tol),
+            "--min-cap-bbox-area",
+            str(args.min_cap_bbox_area),
             "--min-cap-total-arc",
             str(args.min_cap_total_arc),
             "--split-segment-arc",
