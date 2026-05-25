@@ -60,12 +60,31 @@ def main():
     parser.add_argument("--split-corner-angle", type=float, default=30)
     parser.add_argument("--post-split-merge-gap", type=float, default=3)
     parser.add_argument("--post-split-merge-angle", type=float, default=12)
+    parser.add_argument("--post-split-merge-protect-junction-radius", type=float, default=3)
     parser.add_argument("--cap-loop-max-subset-size", type=int, default=15)
     parser.add_argument("--same-loop-endpoint-tol", type=float, default=5)
     parser.add_argument("--min-cap-total-arc", type=float, default=50)
     parser.add_argument("--split-segment-arc", type=float, default=30)
     parser.add_argument("--split-peak-min-distance", type=float, default=10)
     parser.add_argument("--split-optimize-max-iters", type=int, default=5)
+    parser.add_argument(
+        "--skeleton-gap-tol",
+        type=float,
+        default=0.0,
+        help="Forwarded to the extrusion script. Connect mutual-nearest skeleton endpoints within this tolerance and remove unmatched dangling branches before stroke tracing.",
+    )
+    parser.add_argument(
+        "--skeleton-small-loop-bbox-area-thresh",
+        type=float,
+        default=0.0,
+        help="Forwarded to the extrusion script. After skeleton gap connection, remove newly added edges that close loops below this bbox-area threshold. 0 disables this cleanup.",
+    )
+    parser.add_argument(
+        "--skeleton-branch-prune-max-pixels",
+        type=float,
+        default=0.0,
+        help="Forwarded to the extrusion script. Maximum traced pixels for deleting a 02c3 endpoint-started dangling branch; 0 uses the extrusion script automatic guard.",
+    )
     parser.add_argument(
         "--split-segment-arc30",
         action="store_const",
@@ -113,6 +132,28 @@ def main():
         default=15.0,
         help="Pass support-plane fallback polygon tolerance to recover_rank_cap_endpoints_3d.py.",
     )
+    parser.add_argument(
+        "--curve-straightness-thresh",
+        type=float,
+        default=0.9,
+        help="Pass the curved-stroke straightness threshold to recover_rank_cap_endpoints_3d.py.",
+    )
+    parser.add_argument(
+        "--curve-resample-step-px",
+        type=float,
+        default=15.0,
+        help="Pass the curved-stroke 2D resample step to recover_rank_cap_endpoints_3d.py.",
+    )
+    parser.add_argument(
+        "--blender-cap-debug-png",
+        default="debug/blender_reconstruction_cap_2d.png",
+        help="Pass the Blender-cap 2D PNG debug output path to recover_rank_cap_endpoints_3d.py.",
+    )
+    parser.add_argument(
+        "--blender-cap-debug-json",
+        default="debug/blender_reconstruction_cap_2d.json",
+        help="Pass the Blender-cap JSON debug output path to recover_rank_cap_endpoints_3d.py.",
+    )
     args = parser.parse_args()
 
     cwd = Path(__file__).resolve().parent
@@ -148,6 +189,8 @@ def main():
             str(args.post_split_merge_gap),
             "--post-split-merge-angle",
             str(args.post_split_merge_angle),
+            "--post-split-merge-protect-junction-radius",
+            str(args.post_split_merge_protect_junction_radius),
             "--cap-loop-max-subset-size",
             str(args.cap_loop_max_subset_size),
             "--same-loop-endpoint-tol",
@@ -160,6 +203,12 @@ def main():
             str(args.split_peak_min_distance),
             "--split-optimize-max-iters",
             str(args.split_optimize_max_iters),
+            "--skeleton-gap-tol",
+            str(args.skeleton_gap_tol),
+            "--skeleton-small-loop-bbox-area-thresh",
+            str(args.skeleton_small_loop_bbox_area_thresh),
+            "--skeleton-branch-prune-max-pixels",
+            str(args.skeleton_branch_prune_max_pixels),
         ]
         if args.copy_side_iou_compare_percent is not None:
             extrusion_args.extend([
@@ -184,6 +233,14 @@ def main():
             str(args.support_plane_polygon_tol),
             "--copy-side-angle-thresh",
             str(args.parallel_angle_thresh),
+            "--curve-straightness-thresh",
+            str(args.curve_straightness_thresh),
+            "--curve-resample-step-px",
+            str(args.curve_resample_step_px),
+            "--blender-cap-debug-png",
+            str(resolve_path(args.blender_cap_debug_png)),
+            "--blender-cap-debug-json",
+            str(resolve_path(args.blender_cap_debug_json)),
         ]
         if args.reconstruct_blender:
             recover_args.append("--reconstruct-blender")

@@ -4,6 +4,7 @@
 # avoiding false junctions caused by 8-neighbor stair-step skeleton artifacts.
 
 import argparse
+import json
 import math
 import os
 import re
@@ -1021,6 +1022,10 @@ def can_post_split_merge(s1, s2, max_gap=3.0, max_angle=12.0):
             if merged_endpoint_angle > max_angle:
                 continue
             if best is None or gap < best["gap"]:
+                merge_point = 0.5 * (
+                    np.asarray(p1, dtype=np.float64)
+                    + np.asarray(p2, dtype=np.float64)
+                )
                 best = {
                     "end1": int(end1),
                     "end2": int(end2),
@@ -1029,16 +1034,44 @@ def can_post_split_merge(s1, s2, max_gap=3.0, max_angle=12.0):
                     "merged_endpoint_angle": float(merged_endpoint_angle),
                     "merged_endpoint_angle_1": float(merged_angle_1),
                     "merged_endpoint_angle_2": float(merged_angle_2),
+                    "merge_point": (float(merge_point[0]), float(merge_point[1])),
                 }
     return best
 
 
-def merge_post_corner_split_strokes(strokes, max_gap=3.0, max_angle=12.0, max_iters=80):
+def third_stroke_endpoint_near_merge_point(strokes, i, j, info, radius=3.0):
+    """Return nearby third-stroke endpoint metadata when a merge point is a junction."""
+    if radius is None or float(radius) <= 0.0:
+        return None
+    merge_point = np.asarray(info.get("merge_point", (0.0, 0.0)), dtype=np.float64)
+    radius = float(radius)
+    best = None
+    for k, stroke in enumerate(strokes):
+        if k in (i, j):
+            continue
+        for endpoint_i, p in endpoint_candidates_for_merge(stroke):
+            dist = float(np.linalg.norm(np.asarray(p, dtype=np.float64) - merge_point))
+            if dist > radius:
+                continue
+            if best is None or dist < best["distance"]:
+                best = {
+                    "stroke_index": int(k),
+                    "endpoint": int(endpoint_i),
+                    "distance": float(dist),
+                    "point": (float(p[0]), float(p[1])),
+                    "merge_point": (float(merge_point[0]), float(merge_point[1])),
+                }
+    return best
+
+
+def merge_post_corner_split_strokes(strokes, max_gap=3.0, max_angle=12.0, max_iters=80, protect_junction_radius=3.0):
     """
     Merge accidental corner-split fragments that still share a nearly collinear axis.
 
     This is intentionally narrower than the optional topology merge: it only
-    uses endpoint distance and PCA axis angle after corner splitting.
+    uses endpoint distance and PCA axis angle after corner splitting.  A merge
+    endpoint is protected when any third stroke endpoint, even a short one, is
+    already attached there.
     """
     strokes = [s.copy() for s in strokes]
     trace = []
@@ -1049,6 +1082,28 @@ def merge_post_corner_split_strokes(strokes, max_gap=3.0, max_angle=12.0, max_it
             for j in range(i + 1, len(strokes)):
                 info = can_post_split_merge(strokes[i], strokes[j], max_gap=max_gap, max_angle=max_angle)
                 if info is None:
+                    continue
+                protected = third_stroke_endpoint_near_merge_point(
+                    strokes,
+                    i,
+                    j,
+                    info,
+                    radius=protect_junction_radius,
+                )
+                if protected is not None:
+                    trace.append({
+                        "action": "skip_junction_protected",
+                        "left_index": int(i),
+                        "right_index": int(j),
+                        "gap": float(info["gap"]),
+                        "angle": float(info["angle"]),
+                        "merged_endpoint_angle": float(info.get("merged_endpoint_angle", 0.0)),
+                        "merge_point": info.get("merge_point", None),
+                        "protected_by_stroke": int(protected["stroke_index"]),
+                        "protected_by_endpoint": int(protected["endpoint"]),
+                        "protected_by_distance": float(protected["distance"]),
+                        "protected_by_point": protected["point"],
+                    })
                     continue
                 cost = info["gap"] + 0.1 * info["angle"]
                 if best is None or cost < best["cost"]:
@@ -1065,11 +1120,13 @@ def merge_post_corner_split_strokes(strokes, max_gap=3.0, max_angle=12.0, max_it
         i, j = best["i"], best["j"]
         merged = merge_polyline_by_endpoints(strokes[i], best["end1"], strokes[j], best["end2"])
         trace.append({
+            "action": "merge",
             "left_index": int(i),
             "right_index": int(j),
             "gap": float(best["gap"]),
             "angle": float(best["angle"]),
             "merged_endpoint_angle": float(best.get("merged_endpoint_angle", 0.0)),
+            "merge_point": best.get("merge_point", None),
             "merged_len": int(len(merged)),
         })
         strokes = [s for k, s in enumerate(strokes) if k not in (i, j)] + [merged]
@@ -2550,6 +2607,53 @@ def prune_open_branches_from_component(strokes, comp, endpoint_tol=12.0):
     return sorted(remaining), removed
 
 
+def self_loop_positions_in_component(strokes, comp, endpoint_tol=12.0):
+    """
+    Return stroke positions inside comp whose two endpoints match the same external endpoint.
+
+    This is applied only after a loop candidate has already been formed, so the
+    goal is to remove obvious one-stroke self-loops without altering component
+    growth or open-branch pruning.
+    """
+    if not comp:
+        return []
+    comp = list(comp)
+    comp_strokes = [strokes[i] for i in comp]
+    matches = build_nearest_endpoint_matches(comp_strokes, endpoint_tol=endpoint_tol)
+    out = []
+    for pos in range(len(comp_strokes)):
+        m0 = matches.get((int(pos), 0), None)
+        m1 = matches.get((int(pos), 1), None)
+        if m0 is None or m1 is None:
+            continue
+        if m0[0] == pos or m1[0] == pos:
+            continue
+        if m0 == m1:
+            out.append(int(pos))
+    return out
+
+
+def remove_post_loop_self_loops(strokes, comp, endpoint_tol=12.0):
+    """
+    Remove self-loop strokes from an already closed-loop component, then re-check closure.
+    """
+    current = list(comp)
+    removed = []
+
+    changed = True
+    while changed and current:
+        changed = False
+        positions = self_loop_positions_in_component(strokes, current, endpoint_tol=endpoint_tol)
+        if not positions:
+            break
+        changed = True
+        for pos in sorted(positions, reverse=True):
+            removed.append(int(current[pos]))
+            del current[pos]
+
+    return current, removed
+
+
 def is_closed_stroke_graph(comp, endpoint_nodes):
     """
     Strict closed-loop test.
@@ -2700,6 +2804,8 @@ def extract_cap_loop_candidates_from_strokes(
         is connected.
       - Before closed-loop validation, prune dangling open branches from the
         grown component by repeatedly removing strokes with degree-0 endpoints.
+      - Any stroke whose two endpoints collapse into the same endpoint node is
+        treated as a single-stroke self-loop and removed from cap membership.
       - Accept a component as a cap only when every real stroke endpoint has
         exactly one endpoint-proximity connection inside that component.
     """
@@ -2724,22 +2830,41 @@ def extract_cap_loop_candidates_from_strokes(
             continue
         if not is_closed_stroke_component_by_endpoint_proximity(non_side_infos, pruned_comp, endpoint_tol=endpoint_tol):
             continue
+        post_loop_comp, removed_self_loops = remove_post_loop_self_loops(
+            non_side_infos,
+            pruned_comp,
+            endpoint_tol=endpoint_tol,
+        )
+        if not post_loop_comp:
+            continue
+        if removed_self_loops:
+            if not is_closed_stroke_component_by_endpoint_proximity(
+                non_side_infos,
+                post_loop_comp,
+                endpoint_tol=endpoint_tol,
+            ):
+                continue
+        final_comp = list(map(int, post_loop_comp))
 
-        key = tuple(sorted(int(non_side_infos[i]["index"]) for i in pruned_comp))
+        key = tuple(sorted(int(non_side_infos[i]["index"]) for i in final_comp))
         if key in seen:
             continue
         seen.add(key)
 
-        cand = candidate_from_stroke_loop(image_shape, non_side_infos, pruned_comp, thickness=thickness)
+        cand = candidate_from_stroke_loop(image_shape, non_side_infos, final_comp, thickness=thickness)
         if cand["area"] < min_pixels:
             continue
         if cand.get("enclosed_area", 0) < min_enclosed_area:
             continue
         if cand.get("total_arc", 0.0) < min_total_arc:
             continue
-        cand["loop_detection"] = "component_pruned_open_branches" if removed_branch else "component"
-        cand["component_local_indices"] = list(map(int, pruned_comp))
+        if removed_self_loops:
+            cand["loop_detection"] = "component_postloop_self_loop_removed"
+        else:
+            cand["loop_detection"] = "component_pruned_open_branches" if removed_branch else "component"
+        cand["component_local_indices"] = list(map(int, final_comp))
         cand["pruned_branch_strokes"] = [int(non_side_infos[i]["index"]) for i in removed_branch]
+        cand["removed_post_loop_self_strokes"] = [int(non_side_infos[i]["index"]) for i in removed_self_loops]
         candidates.append(cand)
 
     candidates.sort(key=lambda c: (c.get("enclosed_area", 0), c["score"]), reverse=True)
@@ -3182,6 +3307,539 @@ def draw_skeleton_nodes_debug(skel):
     return out
 
 
+def trace_branch_path_from_endpoint(skel, start, stop_nodes=None):
+    """
+    Trace one dangling path from an endpoint until the first branch/endpoint.
+
+    Returns a list of pixel coordinates including start and the terminal node.
+    """
+    stop_nodes = set() if stop_nodes is None else set(stop_nodes)
+    path = [start]
+    prev = None
+    cur = start
+    safety = 0
+
+    while True:
+        safety += 1
+        if safety > 20000:
+            break
+
+        nbs = [q for q in get_neighbors(skel, cur) if q != prev]
+        if not nbs:
+            break
+
+        if len(path) > 1 and skeleton_node_type(skel, cur) in ("endpoint", "branch"):
+            break
+
+        nxt = choose_best_continuation(prev if prev is not None else cur, cur, nbs)
+        if nxt is None:
+            break
+
+        prev, cur = cur, nxt
+        path.append(cur)
+
+        if cur in stop_nodes:
+            break
+        if skeleton_node_type(skel, cur) in ("endpoint", "branch"):
+            break
+
+    return path
+
+
+def endpoint_pairs_mutual_nearest_within_tol(endpoints, tol):
+    """Pair endpoints by mutual nearest-neighbor within tol."""
+    if len(endpoints) < 2:
+        return [], list(range(len(endpoints)))
+
+    pts = [np.asarray(p, dtype=np.float64) for p in endpoints]
+    tol2 = float(tol) * float(tol)
+    nearest = {}
+
+    for i, p in enumerate(pts):
+        best_j = None
+        best_d2 = float("inf")
+        for j, q in enumerate(pts):
+            if i == j:
+                continue
+            d2 = float(np.dot(p - q, p - q))
+            if d2 > tol2:
+                continue
+            if d2 < best_d2:
+                best_d2 = d2
+                best_j = j
+        if best_j is not None:
+            nearest[i] = (best_j, best_d2)
+
+    pairs = []
+    used = set()
+    for i, (j, d2) in nearest.items():
+        if i in used or j in used:
+            continue
+        other = nearest.get(j, None)
+        if other is None or other[0] != i:
+            continue
+        a, b = sorted((i, j))
+        pairs.append((a, b, math.sqrt(d2)))
+        used.add(a)
+        used.add(b)
+
+    unpaired = [i for i in range(len(endpoints)) if i not in used]
+    return pairs, unpaired
+
+
+def rasterize_connection_line(shape, p0, p1, thickness=1):
+    """Rasterize one gap-connection line into its own mask."""
+    mask = np.zeros(shape[:2], dtype=np.uint8)
+    cv2.line(
+        mask,
+        tuple(map(int, p0)),
+        tuple(map(int, p1)),
+        255,
+        int(max(1, thickness)),
+        cv2.LINE_AA,
+    )
+    return mask
+
+
+def shortest_skeleton_path(mask, start, goal):
+    """Return a shortest pixel path between two skeleton pixels, or None."""
+    start = tuple(map(int, start))
+    goal = tuple(map(int, goal))
+    h, w = mask.shape[:2]
+    if not (0 <= start[0] < w and 0 <= start[1] < h):
+        return None
+    if not (0 <= goal[0] < w and 0 <= goal[1] < h):
+        return None
+    if mask[start[1], start[0]] == 0 or mask[goal[1], goal[0]] == 0:
+        return None
+
+    queue = [start]
+    head = 0
+    parent = {start: None}
+    while head < len(queue):
+        cur = queue[head]
+        head += 1
+        if cur == goal:
+            break
+        for nb in get_neighbors(mask, cur):
+            if nb in parent:
+                continue
+            parent[nb] = cur
+            queue.append(nb)
+
+    if goal not in parent:
+        return None
+
+    path = []
+    cur = goal
+    while cur is not None:
+        path.append(cur)
+        cur = parent[cur]
+    path.reverse()
+    return path
+
+
+def bbox_for_points(points):
+    """Return bbox metadata for a non-empty list of (x, y) points."""
+    if not points:
+        return None
+    xs = [int(p[0]) for p in points]
+    ys = [int(p[1]) for p in points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    return {
+        "bbox": (int(x0), int(y0), int(x1), int(y1)),
+        "bbox_area": int((x1 - x0 + 1) * (y1 - y0 + 1)),
+    }
+
+
+def prune_added_connection_small_loops(original_skel, connected_skel, connections, bbox_area_thresh=0.0, connect_thickness=1):
+    """
+    Remove only newly drawn gap-connection pixels when that connection closes a small loop.
+
+    Each added connection is tested by temporarily removing just its new pixels and
+    checking whether its endpoints are still connected through the existing graph.
+    If so, that alternate path plus the added connection is a loop; small loops are
+    filtered by bbox area instead of exact filled area.
+    """
+    current = (connected_skel > 0).astype(np.uint8) * 255
+    original = (original_skel > 0).astype(np.uint8) * 255
+    thresh = float(bbox_area_thresh or 0.0)
+    records = []
+
+    for ci, item in enumerate(connections):
+        p0 = tuple(map(int, item["p0"]))
+        p1 = tuple(map(int, item["p1"]))
+        line_mask = rasterize_connection_line(current.shape, p0, p1, thickness=connect_thickness)
+        added_mask = ((line_mask > 0) & (original == 0)).astype(np.uint8) * 255
+        active_added = (added_mask > 0) & (current > 0)
+        ys, xs = np.where(active_added)
+        added_points = list(zip(xs.tolist(), ys.tolist()))
+
+        record = {
+            "connection_index": int(ci),
+            "p0": p0,
+            "p1": p1,
+            "added_pixel_count": int(len(added_points)),
+            "forms_loop": False,
+            "removed": False,
+            "skip_reason": "",
+            "bbox": None,
+            "bbox_area": 0,
+            "alternate_path_pixels": 0,
+        }
+
+        if thresh <= 0.0:
+            record["skip_reason"] = "threshold_disabled"
+            records.append(record)
+            continue
+        if not added_points:
+            record["skip_reason"] = "no_new_pixels"
+            records.append(record)
+            continue
+
+        trial = current.copy()
+        trial[active_added] = 0
+        path = shortest_skeleton_path(trial, p0, p1)
+        if path is None:
+            record["skip_reason"] = "no_alternate_path"
+            records.append(record)
+            continue
+
+        loop_points = path + added_points
+        bbox = bbox_for_points(loop_points)
+        record["forms_loop"] = True
+        record["alternate_path_pixels"] = int(len(path))
+        if bbox is not None:
+            record["bbox"] = bbox["bbox"]
+            record["bbox_area"] = int(bbox["bbox_area"])
+
+        if record["bbox_area"] < thresh:
+            current[active_added] = 0
+            record["removed"] = True
+            record["skip_reason"] = ""
+        else:
+            record["skip_reason"] = "bbox_area_ge_threshold"
+        records.append(record)
+
+    current = remove_small_components(current, min_area=1)
+    return current, records
+
+
+def skeleton_branch_stop_points(skel):
+    """Return branch points from a fixed skeleton snapshot."""
+    stops = set()
+    ys, xs = np.where(skel > 0)
+    for x, y in zip(xs, ys):
+        p = (int(x), int(y))
+        if skeleton_node_type(skel, p) == "branch":
+            stops.add(p)
+    return stops
+
+
+def prune_dangling_branches_from_endpoints(skel, endpoints, max_pixels=None, stop_nodes=None):
+    """Remove endpoint-started dangling paths from the current skeleton."""
+    cleaned = (skel > 0).astype(np.uint8) * 255
+    removed_paths = []
+    skipped_paths = []
+    stop_nodes = set() if stop_nodes is None else set(stop_nodes)
+    max_pixels = None if max_pixels is None or float(max_pixels) <= 0.0 else float(max_pixels)
+
+    for p in endpoints:
+        p = tuple(map(int, p))
+        if not (0 <= p[0] < cleaned.shape[1] and 0 <= p[1] < cleaned.shape[0]):
+            continue
+        if cleaned[p[1], p[0]] == 0:
+            continue
+        if skeleton_node_type(cleaned, p) != "endpoint":
+            continue
+        path = trace_branch_path_from_endpoint(cleaned, p, stop_nodes=stop_nodes)
+        if not path:
+            continue
+        if max_pixels is not None and len(path) > max_pixels:
+            skipped_paths.append({
+                "path": [tuple(map(int, q)) for q in path],
+                "reason": "longer_than_max_pixels",
+                "max_pixels": float(max_pixels),
+            })
+            continue
+        removed_paths.append(path)
+        for x, y in path[:-1]:
+            cleaned[y, x] = 0
+        end_x, end_y = path[-1]
+        if (end_x, end_y) not in stop_nodes and skeleton_node_type(cleaned, (end_x, end_y)) == "endpoint":
+            cleaned[end_y, end_x] = 0
+
+    cleaned = remove_small_components(cleaned, min_area=1)
+    return cleaned, removed_paths, skipped_paths
+
+
+def cleanup_skeleton_endpoints(
+    skel,
+    gap_tol=0.0,
+    connect_thickness=1,
+    small_loop_bbox_area_thresh=0.0,
+    branch_prune_max_pixels=0.0,
+):
+    """
+    Connect mutual-nearest endpoint pairs within gap_tol, then drop dead branches.
+
+    Returns cleaned skeleton plus debug metadata.
+    """
+    work = (skel > 0).astype(np.uint8) * 255
+    endpoints_before = skeleton_endpoints_for_closure(work)
+
+    if gap_tol is None or float(gap_tol) <= 0.0 or len(endpoints_before) < 2:
+        return work, work.copy(), work.copy(), {
+            "endpoint_count_before": int(len(endpoints_before)),
+            "endpoint_count_after_connect": int(len(endpoints_before)),
+            "endpoint_count_after_small_loop_prune": int(len(endpoints_before)),
+            "endpoint_count_final": int(len(endpoints_before)),
+            "gap_tol": float(gap_tol or 0.0),
+            "small_loop_bbox_area_thresh": float(small_loop_bbox_area_thresh or 0.0),
+            "connections": [],
+            "small_loop_added_edge_candidates": [],
+            "removed_branches": [],
+            "skipped_branches": [],
+            "removed_endpoint_count": 0,
+            "branch_prune_endpoint_count": 0,
+            "branch_prune_endpoint_source": "not_run",
+            "branch_prune_max_pixels": 0.0,
+        }
+
+    pairs, unpaired = endpoint_pairs_mutual_nearest_within_tol(endpoints_before, gap_tol)
+    connected = work.copy()
+    connections = []
+    for i, j, _dist in pairs:
+        p0 = tuple(map(int, endpoints_before[i]))
+        p1 = tuple(map(int, endpoints_before[j]))
+        cv2.line(
+            connected,
+            p0,
+            p1,
+            255,
+            int(max(1, connect_thickness)),
+            cv2.LINE_AA,
+        )
+        connections.append({
+            "connection_index": int(len(connections)),
+            "p0": p0,
+            "p1": p1,
+            "dist": float(_dist),
+        })
+
+    endpoints_after_connect = skeleton_endpoints_for_closure(connected)
+    small_loop_pruned, small_loop_records = prune_added_connection_small_loops(
+        work,
+        connected,
+        connections,
+        bbox_area_thresh=small_loop_bbox_area_thresh,
+        connect_thickness=connect_thickness,
+    )
+    endpoints_after_small_loop_prune = skeleton_endpoints_for_closure(small_loop_pruned)
+
+    if float(small_loop_bbox_area_thresh or 0.0) > 0.0:
+        branch_prune_points = endpoints_after_small_loop_prune
+        branch_prune_source = "all_02c2_endpoints_after_small_loop_prune"
+    else:
+        branch_prune_points = [endpoints_before[i] for i in unpaired]
+        branch_prune_source = "unpaired_original_endpoints"
+
+    effective_branch_prune_max_pixels = None
+    if branch_prune_max_pixels is not None and float(branch_prune_max_pixels) > 0.0:
+        effective_branch_prune_max_pixels = float(branch_prune_max_pixels)
+    elif float(small_loop_bbox_area_thresh or 0.0) > 0.0:
+        effective_branch_prune_max_pixels = float(max(30.0, 3.0 * float(gap_tol)))
+
+    branch_stop_nodes = skeleton_branch_stop_points(small_loop_pruned)
+    cleaned, removed_paths, skipped_paths = prune_dangling_branches_from_endpoints(
+        small_loop_pruned,
+        branch_prune_points,
+        max_pixels=effective_branch_prune_max_pixels,
+        stop_nodes=branch_stop_nodes,
+    )
+    endpoints_final = skeleton_endpoints_for_closure(cleaned)
+
+    return connected, small_loop_pruned, cleaned, {
+        "endpoint_count_before": int(len(endpoints_before)),
+        "endpoint_count_after_connect": int(len(endpoints_after_connect)),
+        "endpoint_count_after_small_loop_prune": int(len(endpoints_after_small_loop_prune)),
+        "endpoint_count_final": int(len(endpoints_final)),
+        "endpoints_before": [tuple(map(int, p)) for p in endpoints_before],
+        "endpoints_after_connect": [tuple(map(int, p)) for p in endpoints_after_connect],
+        "endpoints_after_small_loop_prune": [tuple(map(int, p)) for p in endpoints_after_small_loop_prune],
+        "endpoints_final": [tuple(map(int, p)) for p in endpoints_final],
+        "gap_tol": float(gap_tol),
+        "small_loop_bbox_area_thresh": float(small_loop_bbox_area_thresh or 0.0),
+        "connections": connections,
+        "small_loop_added_edge_candidates": small_loop_records,
+        "removed_branches": [
+            [tuple(map(int, q)) for q in path]
+            for path in removed_paths
+        ],
+        "skipped_branches": skipped_paths,
+        "removed_endpoint_count": int(len(branch_prune_points)),
+        "branch_prune_endpoint_count": int(len(branch_prune_points)),
+        "branch_prune_points": [tuple(map(int, p)) for p in branch_prune_points],
+        "branch_prune_endpoint_source": branch_prune_source,
+        "branch_prune_stop_nodes": sorted([tuple(map(int, p)) for p in branch_stop_nodes]),
+        "branch_prune_stop_node_count": int(len(branch_stop_nodes)),
+        "branch_prune_max_pixels": (
+            0.0 if effective_branch_prune_max_pixels is None else float(effective_branch_prune_max_pixels)
+        ),
+    }
+
+
+def draw_skeleton_cleanup_debug(shape, skel_before, skel_after_connect, skel_after_prune, cleanup_info):
+    """Visualize skeleton endpoint connection and dangling-branch removal."""
+    h, w = shape[:2]
+    out = np.full((h, w, 3), 255, dtype=np.uint8)
+    out[skel_after_prune > 0] = (0, 0, 0)
+
+    removed_connection_indices = {
+        int(item.get("connection_index", -1))
+        for item in cleanup_info.get("small_loop_added_edge_candidates", [])
+        if item.get("removed", False)
+    }
+    for item in cleanup_info.get("connections", []):
+        ci = int(item.get("connection_index", len(removed_connection_indices)))
+        p0 = tuple(item["p0"])
+        p1 = tuple(item["p1"])
+        color = (180, 0, 180) if ci in removed_connection_indices else (0, 170, 0)
+        cv2.line(out, p0, p1, color, 1, cv2.LINE_AA)
+        cv2.circle(out, p0, 3, color, -1, cv2.LINE_AA)
+        cv2.circle(out, p1, 3, color, -1, cv2.LINE_AA)
+
+    for item in cleanup_info.get("small_loop_added_edge_candidates", []):
+        if not item.get("forms_loop", False):
+            continue
+        bbox = item.get("bbox", None)
+        if bbox is None:
+            continue
+        x0, y0, x1, y1 = map(int, bbox)
+        color = (180, 0, 180) if item.get("removed", False) else (0, 180, 180)
+        cv2.rectangle(out, (x0, y0), (x1, y1), color, 1, cv2.LINE_AA)
+        cv2.putText(
+            out,
+            f"a={int(item.get('bbox_area', 0))}",
+            (x0, max(12, y0 - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+    for path in cleanup_info.get("removed_branches", []):
+        if len(path) < 2:
+            continue
+        pts = np.asarray(path, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(out, [pts], False, (0, 140, 255), 2, cv2.LINE_AA)
+
+    for item in cleanup_info.get("skipped_branches", []):
+        path = item.get("path", [])
+        if len(path) < 2:
+            continue
+        pts = np.asarray(path, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(out, [pts], False, (180, 180, 0), 2, cv2.LINE_AA)
+
+    cv2.putText(
+        out,
+        f"endpoint cleanup: tol={cleanup_info.get('gap_tol', 0.0):.1f}, "
+        f"connected={len(cleanup_info.get('connections', []))}, "
+        f"small_loop_links={len(removed_connection_indices)}, "
+        f"branches={len(cleanup_info.get('removed_branches', []))}",
+        (15, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (0, 0, 0),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        out,
+        "green=kept endpoint links, purple=small-loop links removed, orange=removed dangling branches, cyan=skipped long branches",
+        (15, 48),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (0, 0, 0),
+        1,
+        cv2.LINE_AA,
+    )
+    return out
+
+
+def save_skeleton_cleanup_debug_outputs(debug_dir, skel_before, skel_after_connect, skel_after_small_loop_prune, skel_after_prune, cleanup_info):
+    """Save debug images/text for skeleton endpoint cleanup."""
+    if debug_dir is None:
+        return
+    cv2.imwrite(os.path.join(debug_dir, "02c_skeleton_after_gap_connect.png"), skel_after_connect)
+    cv2.imwrite(os.path.join(debug_dir, "02c1_skeleton_after_gap_connect_nodes.png"), draw_skeleton_nodes_debug(skel_after_connect))
+    cv2.imwrite(os.path.join(debug_dir, "02c2_skeleton_after_small_loop_prune.png"), skel_after_small_loop_prune)
+    cv2.imwrite(os.path.join(debug_dir, "02c3_skeleton_after_small_loop_prune_nodes.png"), draw_skeleton_nodes_debug(skel_after_small_loop_prune))
+    cv2.imwrite(os.path.join(debug_dir, "02d_skeleton_after_branch_prune.png"), skel_after_prune)
+    cv2.imwrite(os.path.join(debug_dir, "02d1_skeleton_after_branch_prune_nodes.png"), draw_skeleton_nodes_debug(skel_after_prune))
+    cv2.imwrite(
+        os.path.join(debug_dir, "02d2_skeleton_endpoint_cleanup_overlay.png"),
+        draw_skeleton_cleanup_debug(skel_before.shape, skel_before, skel_after_connect, skel_after_prune, cleanup_info),
+    )
+    with open(os.path.join(debug_dir, "02d_skeleton_endpoint_cleanup.json"), "w", encoding="utf-8") as jf:
+        json.dump(cleanup_info, jf, indent=2)
+    with open(os.path.join(debug_dir, "02d_skeleton_endpoint_cleanup.txt"), "w", encoding="utf-8") as f:
+        f.write("==== Skeleton Endpoint Cleanup ====\n\n")
+        f.write(f"gap_tol: {float(cleanup_info.get('gap_tol', 0.0)):.1f}\n")
+        f.write(f"small_loop_bbox_area_thresh: {float(cleanup_info.get('small_loop_bbox_area_thresh', 0.0)):.1f}\n")
+        f.write(f"branch_prune_max_pixels: {float(cleanup_info.get('branch_prune_max_pixels', 0.0)):.1f}\n")
+        f.write(f"endpoint_count_before: {int(cleanup_info.get('endpoint_count_before', 0))}\n")
+        f.write(f"endpoint_count_after_connect: {int(cleanup_info.get('endpoint_count_after_connect', 0))}\n")
+        f.write(f"endpoint_count_after_small_loop_prune: {int(cleanup_info.get('endpoint_count_after_small_loop_prune', 0))}\n")
+        f.write(f"endpoint_count_final: {int(cleanup_info.get('endpoint_count_final', 0))}\n")
+        f.write(f"connections: {len(cleanup_info.get('connections', []))}\n")
+        for i, item in enumerate(cleanup_info.get("connections", [])):
+            f.write(
+                f"  connect {i:03d}: p0={item['p0']} p1={item['p1']} dist={float(item['dist']):.2f}\n"
+            )
+        f.write(f"endpoints_on_02c2_after_small_loop_prune: {len(cleanup_info.get('endpoints_after_small_loop_prune', []))}\n")
+        for i, p in enumerate(cleanup_info.get("endpoints_after_small_loop_prune", [])):
+            f.write(f"  02c2 endpoint {i:03d}: {p}\n")
+        records = cleanup_info.get("small_loop_added_edge_candidates", [])
+        f.write(f"small_loop_added_edge_candidates: {len(records)}\n")
+        for item in records:
+            f.write(
+                f"  edge {int(item.get('connection_index', -1)):03d}: "
+                f"p0={item.get('p0')} p1={item.get('p1')} "
+                f"added_pixels={int(item.get('added_pixel_count', 0))} "
+                f"forms_loop={bool(item.get('forms_loop', False))} "
+                f"bbox={item.get('bbox')} bbox_area={int(item.get('bbox_area', 0))} "
+                f"alternate_path_pixels={int(item.get('alternate_path_pixels', 0))} "
+                f"removed={bool(item.get('removed', False))} "
+                f"reason={item.get('skip_reason', '')}\n"
+            )
+        f.write(f"branch_prune_endpoint_source: {cleanup_info.get('branch_prune_endpoint_source', '')}\n")
+        f.write(f"branch_prune_endpoint_count: {int(cleanup_info.get('branch_prune_endpoint_count', 0))}\n")
+        f.write(f"branch_prune_stop_node_count: {int(cleanup_info.get('branch_prune_stop_node_count', 0))}\n")
+        for i, p in enumerate(cleanup_info.get("branch_prune_points", [])):
+            f.write(f"  branch prune endpoint {i:03d}: {p}\n")
+        for i, p in enumerate(cleanup_info.get("branch_prune_stop_nodes", [])):
+            f.write(f"  frozen 02c2 branch stop {i:03d}: {p}\n")
+        f.write(f"removed_branches: {len(cleanup_info.get('removed_branches', []))}\n")
+        for i, path in enumerate(cleanup_info.get("removed_branches", [])):
+            start = path[0] if path else None
+            end = path[-1] if path else None
+            f.write(
+                f"  remove {i:03d}: pixels={len(path)} start={start} end={end} path={path}\n"
+            )
+        f.write(f"skipped_branches: {len(cleanup_info.get('skipped_branches', []))}\n")
+        for i, item in enumerate(cleanup_info.get("skipped_branches", [])):
+            path = item.get("path", [])
+            start = path[0] if path else None
+            end = path[-1] if path else None
+            f.write(
+                f"  skip {i:03d}: pixels={len(path)} start={start} end={end} "
+                f"reason={item.get('reason', '')} max_pixels={float(item.get('max_pixels', 0.0)):.1f} path={path}\n"
+            )
+
+
 def write_corner_split_trace_report(path, trace, angle_thresh=None, peak_min_distance=None):
     """Write raw trace stroke to post-corner-split stroke mapping."""
     with open(path, "w", encoding="utf-8") as f:
@@ -3492,12 +4150,13 @@ def draw_corner_split_scan_points_image(shape, trace):
     return out
 
 
-def write_post_split_merge_trace_report(path, trace, max_gap=None, max_angle=None):
+def write_post_split_merge_trace_report(path, trace, max_gap=None, max_angle=None, protect_junction_radius=None):
     """Write post-corner-split merge operations."""
     with open(path, "w", encoding="utf-8") as f:
         f.write("==== Post Corner Split Merge Trace ====\n\n")
         f.write(f"post_split_merge_gap: {max_gap}\n")
         f.write(f"post_split_merge_angle: {max_angle}\n")
+        f.write(f"post_split_merge_protect_junction_radius: {protect_junction_radius}\n")
         f.write("Merges use endpoint gap, PCA axis angle, and merged endpoint-chord angle.\n\n")
 
         if not trace:
@@ -3505,14 +4164,30 @@ def write_post_split_merge_trace_report(path, trace, max_gap=None, max_angle=Non
             return
 
         for i, item in enumerate(trace):
-            f.write(
-                f"{i:03d}: merge current_stroke[{item.get('left_index')}] "
-                f"+ current_stroke[{item.get('right_index')}], "
-                f"gap={item.get('gap', 0.0):.2f}, "
-                f"angle={item.get('angle', 0.0):.2f}, "
-                f"merged_endpoint_angle={item.get('merged_endpoint_angle', 0.0):.2f}, "
-                f"merged_len={item.get('merged_len', 0)}\n"
-            )
+            action = item.get("action", "merge")
+            if action == "skip_junction_protected":
+                f.write(
+                    f"{i:03d}: skip junction-protected current_stroke[{item.get('left_index')}] "
+                    f"+ current_stroke[{item.get('right_index')}], "
+                    f"gap={item.get('gap', 0.0):.2f}, "
+                    f"angle={item.get('angle', 0.0):.2f}, "
+                    f"merged_endpoint_angle={item.get('merged_endpoint_angle', 0.0):.2f}, "
+                    f"merge_point={item.get('merge_point', None)}, "
+                    f"protected_by=current_stroke[{item.get('protected_by_stroke', -1)}]:"
+                    f"{'start' if int(item.get('protected_by_endpoint', 0)) == 0 else 'end'}, "
+                    f"protected_dist={float(item.get('protected_by_distance', 0.0)):.2f}, "
+                    f"protected_point={item.get('protected_by_point', None)}\n"
+                )
+            else:
+                f.write(
+                    f"{i:03d}: merge current_stroke[{item.get('left_index')}] "
+                    f"+ current_stroke[{item.get('right_index')}], "
+                    f"gap={item.get('gap', 0.0):.2f}, "
+                    f"angle={item.get('angle', 0.0):.2f}, "
+                    f"merged_endpoint_angle={item.get('merged_endpoint_angle', 0.0):.2f}, "
+                    f"merge_point={item.get('merge_point', None)}, "
+                    f"merged_len={item.get('merged_len', 0)}\n"
+                )
 
 
 def draw_stroke_infos_image(shape, infos, thickness=2):
@@ -3602,6 +4277,31 @@ def write_stroke_direction_debug_report(path, infos, line_strokes):
                 b = line_strokes[j]
                 ang = angle_between_dirs(a["direction"], b["direction"])
                 f.write(f"  ({int(a['index'])},{int(b['index'])}): angle={ang:.2f}\n")
+
+
+def write_stroke_direction_debug_json(path, infos, line_strokes):
+    """Write stroke geometry with full sampled points for downstream recovery."""
+    if path is None:
+        return
+    line_ids = {int(s["index"]) for s in line_strokes}
+    payload = {
+        "strokes": [
+            {
+                "index": int(s["index"]),
+                "line_candidate": int(s["index"]) in line_ids,
+                "arc": float(s["arc"]),
+                "chord": float(s["chord"]),
+                "straightness": float(s["straightness"]),
+                "center": [float(x) for x in np.asarray(s["center"], dtype=float).tolist()],
+                "p0": [float(x) for x in np.asarray(s["points"][0], dtype=float).tolist()],
+                "p1": [float(x) for x in np.asarray(s["points"][-1], dtype=float).tolist()],
+                "points": [[float(x), float(y)] for x, y in np.asarray(s["points"], dtype=float).tolist()],
+            }
+            for s in infos
+        ]
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
 
 
 def draw_stroke_directions_image(shape, infos, line_strokes, arrow_len=70):
@@ -5568,6 +6268,7 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
                     f"best_cap_area={cap_candidate.get('area', 0)} best_cap_enclosed_area={cap_candidate.get('enclosed_area', 0)} "
                     f"best_cap_total_arc={cap_candidate.get('total_arc', 0.0):.1f} "
                     f"best_cap_score={cap_candidate.get('score', 0.0):.1f} "
+                    f"removed_post_loop_self_strokes={cap_candidate.get('removed_post_loop_self_strokes', [])} "
                     f"{copy_side_txt} "
                     f"source={entry.get('source', 'unknown')} parent={entry.get('parent_cluster_id', None)} "
                     f"removed={entry.get('removed_stroke_indices', [])} depth={entry.get('removal_depth', 0)}\n"
@@ -5637,7 +6338,8 @@ def save_debug_report(path, args, raw_strokes, merged_strokes, infos, line_strok
                 f"enclosed_area={c.get('enclosed_area', 0)}, "
                 f"endpoints={c['endpoints']}, closedness={c['closedness']:.2f}, "
                 f"total_arc={c.get('total_arc', 0.0):.1f}, "
-                f"score={c['score']:.1f}, center={ctr_txt}, strokes={stroke_txt}\n"
+                f"score={c['score']:.1f}, center={ctr_txt}, strokes={stroke_txt}, "
+                f"removed_post_loop_self_strokes={c.get('removed_post_loop_self_strokes', [])}\n"
             )
 
 
@@ -6128,6 +6830,7 @@ def save_post_split_merge_debug_outputs(debug_dir, args, img_shape, raw_strokes,
         post_split_merge_trace,
         max_gap=args.post_split_merge_gap,
         max_angle=args.post_split_merge_angle,
+        protect_junction_radius=args.post_split_merge_protect_junction_radius,
     )
     cv2.imwrite(
         os.path.join(debug_dir, "03a2_after_post_split_merge.png"),
@@ -6154,6 +6857,7 @@ def save_stroke_info_debug_outputs(debug_dir, args, img_shape, infos, line_strok
     cv2.imwrite(os.path.join(debug_dir, "04_stroke_info.png"), draw_stroke_infos_image(img_shape, infos, thickness=2))
     cv2.imwrite(os.path.join(debug_dir, "05_line_stroke_candidates.png"), draw_line_stroke_candidates_image(img_shape, line_strokes, thickness=3))
     write_stroke_direction_debug_report(os.path.join(debug_dir, "05a_stroke_directions.txt"), infos, line_strokes)
+    write_stroke_direction_debug_json(os.path.join(debug_dir, "05a_stroke_directions.json"), infos, line_strokes)
     cv2.imwrite(os.path.join(debug_dir, "05a_stroke_directions.png"), draw_stroke_directions_image(img_shape, infos, line_strokes))
 
     direction_group_strokes = [s for s in infos if s["arc"] >= args.min_stroke_length]
@@ -6221,11 +6925,13 @@ def save_debug_outputs(debug_dir, args, img, bw, skel, pre_post_split_merge_stro
         post_split_merge_trace,
         max_gap=args.post_split_merge_gap,
         max_angle=args.post_split_merge_angle,
+        protect_junction_radius=args.post_split_merge_protect_junction_radius,
     )
     cv2.imwrite(os.path.join(debug_dir, "03b_merged_strokes.png"), draw_strokes_image(img.shape, merged_strokes, thickness=2, annotate=True))
     cv2.imwrite(os.path.join(debug_dir, "04_stroke_info.png"), draw_stroke_infos_image(img.shape, infos, thickness=2))
     cv2.imwrite(os.path.join(debug_dir, "05_line_stroke_candidates.png"), draw_line_stroke_candidates_image(img.shape, line_strokes, thickness=3))
     write_stroke_direction_debug_report(os.path.join(debug_dir, "05a_stroke_directions.txt"), infos, line_strokes)
+    write_stroke_direction_debug_json(os.path.join(debug_dir, "05a_stroke_directions.json"), infos, line_strokes)
     cv2.imwrite(os.path.join(debug_dir, "05a_stroke_directions.png"), draw_stroke_directions_image(img.shape, infos, line_strokes))
     direction_group_strokes = [s for s in infos if s["arc"] >= args.min_stroke_length]
     write_direction_groups_debug_report(
@@ -6320,6 +7026,8 @@ def main():
                         help="Max endpoint gap for merging accidental post-corner-split fragments.")
     parser.add_argument("--post-split-merge-angle", type=float, default=12.0,
                         help="Max PCA axis angle difference for merging accidental post-corner-split fragments.")
+    parser.add_argument("--post-split-merge-protect-junction-radius", type=float, default=3.0,
+                        help="Reject a post-corner-split merge when any third stroke endpoint, including short strokes, lies within this radius of the proposed merge point. 0 disables this protection.")
     parser.add_argument("--enable-merge", action="store_true", help="Optional: merge fake endpoint breaks. Disabled by default; raw strokes are used directly.")
     parser.add_argument("--merge-gap", type=float, default=10.0)
     parser.add_argument("--merge-angle", type=float, default=40.0)
@@ -6362,6 +7070,12 @@ def main():
     parser.add_argument("--cluster-length-similarity-weight", type=float, default=10000.0,
                         help="Reward clusters whose stroke lengths are similar. Score adds weight * (1 / (1 + length_cv)).")
 
+    parser.add_argument("--skeleton-gap-tol", type=float, default=0.0,
+                        help="Before stroke tracing, connect mutual-nearest skeleton endpoints within this gap tolerance and remove unmatched dangling branches. 0 disables skeleton cleanup.")
+    parser.add_argument("--skeleton-small-loop-bbox-area-thresh", type=float, default=0.0,
+                        help="After skeleton gap connection, remove only newly added gap edges that close a loop whose loop-pixel bbox area is below this threshold. 0 disables this small-loop cleanup.")
+    parser.add_argument("--skeleton-branch-prune-max-pixels", type=float, default=0.0,
+                        help="Maximum traced pixels for deleting a 02c3 endpoint-started dangling branch. 0 uses an automatic max(30, 3*skeleton-gap-tol) when small-loop cleanup is enabled; use a large value to disable this guard.")
     parser.add_argument("--side-thickness", type=int, default=4)
     parser.add_argument("--min-cap-pixels", type=int, default=40)
     parser.add_argument("--min-cap-enclosed-area", type=int, default=0,
@@ -6390,6 +7104,25 @@ def main():
     )
     save_preprocess_debug_outputs(args.debug_dir, img, bw, skel)
 
+    if args.skeleton_gap_tol > 0.0:
+        skel_before_cleanup = skel.copy()
+        skel_after_connect, skel_after_small_loop_prune, skel_after_prune, cleanup_info = cleanup_skeleton_endpoints(
+            skel,
+            gap_tol=args.skeleton_gap_tol,
+            connect_thickness=1,
+            small_loop_bbox_area_thresh=args.skeleton_small_loop_bbox_area_thresh,
+            branch_prune_max_pixels=args.skeleton_branch_prune_max_pixels,
+        )
+        skel = skel_after_prune
+        save_skeleton_cleanup_debug_outputs(
+            args.debug_dir,
+            skel_before_cleanup,
+            skel_after_connect,
+            skel_after_small_loop_prune,
+            skel_after_prune,
+            cleanup_info,
+        )
+
     traced_strokes = trace_strokes(skel, min_pixels=args.trace_min_pixels)
     save_trace_debug_outputs(args.debug_dir, img.shape, traced_strokes)
 
@@ -6417,6 +7150,7 @@ def main():
             raw_strokes,
             max_gap=args.post_split_merge_gap,
             max_angle=args.post_split_merge_angle,
+            protect_junction_radius=args.post_split_merge_protect_junction_radius,
         )
     save_post_split_merge_debug_outputs(
         args.debug_dir,

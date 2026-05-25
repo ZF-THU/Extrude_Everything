@@ -72,6 +72,29 @@ def load_strokes(path):
     return strokes
 
 
+def load_strokes_json(path):
+    path = Path(path)
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    strokes = {}
+    for item in data.get("strokes", []):
+        sid = int(item["index"])
+        points = np.array(item.get("points", []), dtype=float)
+        if len(points) < 2:
+            continue
+        strokes[sid] = {
+            "id": sid,
+            "arc": float(item.get("arc", 0.0)),
+            "chord": float(item.get("chord", 0.0)),
+            "straightness": float(item.get("straightness", 1.0)),
+            "p0": points[0],
+            "p1": points[-1],
+            "points": points,
+        }
+    return strokes if strokes else None
+
+
 def load_cluster_entries(path):
     entries = []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
@@ -160,7 +183,7 @@ def snap_nearby_endpoint_pairs(endpoint_members, tol):
     return groups
 
 
-def load_cap_endpoint_graph_groups(path, cluster_id, cap_ids, tol):
+def load_cap_endpoint_graph_groups(path, cluster_id, cap_ids, tol, strokes=None, straightness_threshold=0.9, resample_step=15.0):
     path = Path(path)
     if not path.exists():
         return None, f"{path} does not exist"
@@ -182,9 +205,11 @@ def load_cap_endpoint_graph_groups(path, cluster_id, cap_ids, tol):
 
         component_match = CAP_GRAPH_COMPONENT_RE.search(line)
         if component_match:
+            strokes_match = re.search(r"strokes=\[([^\]]*)\]", line)
             current_component = {
                 "component": int(component_match.group(1)),
                 "pruned_closed": component_match.group(2) == "True",
+                "strokes_in_order": parse_int_list(strokes_match.group(1)) if strokes_match else [],
                 "pruned_strokes": parse_int_list(component_match.group(3)),
                 "endpoints": [],
             }
@@ -196,12 +221,20 @@ def load_cap_endpoint_graph_groups(path, cluster_id, cap_ids, tol):
             sid = int(endpoint_match.group(1))
             if sid not in target_cap_ids:
                 continue
+            pixel = np.array([float(endpoint_match.group(3)), float(endpoint_match.group(4))], dtype=float)
+            if strokes is not None and sid in strokes:
+                polyline_2d, _ = recovery_stroke_polyline(
+                    strokes[sid],
+                    straightness_threshold=straightness_threshold,
+                    resample_step=resample_step,
+                )
+                pixel = polyline_2d[0] if endpoint_match.group(2) == "start" else polyline_2d[-1]
             current_component["endpoints"].append(
                 {
                     "stroke": sid,
                     "endpoint": "p0" if endpoint_match.group(2) == "start" else "p1",
                     "graph_endpoint": endpoint_match.group(2),
-                    "pixel": np.array([float(endpoint_match.group(3)), float(endpoint_match.group(4))], dtype=float),
+                    "pixel": pixel,
                     "degree": int(endpoint_match.group(5)),
                     "matches": endpoint_match.group(6),
                 }
@@ -259,6 +292,7 @@ def load_cap_endpoint_graph_groups(path, cluster_id, cap_ids, tol):
         "source": str(path),
         "cluster": int(cluster_id),
         "component": int(chosen["component"]),
+        "component_strokes_in_order": [int(s) for s in chosen.get("strokes_in_order", []) if int(s) in target_cap_ids],
         "pruned_strokes": [int(s) for s in chosen["pruned_strokes"]],
         "exact_pruned_strokes_match": set(chosen["pruned_strokes"]) == target_cap_ids,
         "raw_endpoint_count": int(raw_endpoint_count),
@@ -266,6 +300,14 @@ def load_cap_endpoint_graph_groups(path, cluster_id, cap_ids, tol):
         "one_pass_pair_snap_tolerance_pixels": float(tol),
         "one_pass_pair_snap_count": int(snapped_pair_count),
         "graph_edges_group_indices": [[int(a), int(b)] for a, b in sorted(graph_edges)],
+        "stroke_group_indices": {
+            str(int(sid)): {
+                "start": int(member_to_group[(sid, "start")]),
+                "end": int(member_to_group[(sid, "end")]),
+            }
+            for sid in target_cap_ids
+            if (sid, "start") in member_to_group and (sid, "end") in member_to_group
+        },
     }
     return groups, metadata
 
@@ -1224,11 +1266,460 @@ def unit(v):
     return np.array(v, dtype=float) / length
 
 
-def group_cap_endpoints(strokes, cap_ids, tol):
+def resample_polyline_by_step(points, step=15.0):
+    pts = np.asarray(points, dtype=float)
+    if len(pts) < 2:
+        return pts.copy()
+    step = float(step)
+    if step <= 0:
+        return pts.copy()
+    segs = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    total = float(np.sum(segs))
+    if total <= 1e-9:
+        return np.vstack([pts[0], pts[-1]])
+    target = np.arange(0.0, total + 1e-9, step)
+    if target[-1] < total:
+        target = np.append(target, total)
+    out = [pts[0]]
+    accumulated = 0.0
+    seg_i = 0
+    for dist in target[1:]:
+        while seg_i < len(segs) and accumulated + segs[seg_i] < dist:
+            accumulated += segs[seg_i]
+            seg_i += 1
+        if seg_i >= len(segs):
+            out.append(pts[-1])
+            continue
+        seg_len = segs[seg_i]
+        if seg_len <= 1e-9:
+            out.append(pts[seg_i + 1])
+            continue
+        t = (dist - accumulated) / seg_len
+        out.append(pts[seg_i] * (1.0 - t) + pts[seg_i + 1] * t)
+    return np.asarray(out, dtype=float)
+
+
+def simplify_stroke_points(stroke, straightness_threshold=0.9, resample_step=15.0):
+    points = np.asarray(stroke.get("points", [stroke["p0"], stroke["p1"]]), dtype=float)
+    straightness = float(stroke.get("straightness", 1.0))
+    if straightness >= float(straightness_threshold) or len(points) < 3:
+        return np.vstack([points[0], points[-1]]), False
+
+    resampled = resample_polyline_by_step(points, step=resample_step)
+    if len(resampled) < 2:
+        return np.vstack([points[0], points[-1]]), False
+
+    center = np.mean(resampled, axis=0)
+    X = resampled - center
+    cov = X.T @ X / max(len(resampled), 1)
+    vals, vecs = np.linalg.eigh(cov)
+    direction = vecs[:, int(np.argmax(vals))]
+    direction = unit(direction)
+    if norm(direction) < 1e-9:
+        return np.vstack([points[0], points[-1]]), False
+    proj = X @ direction
+    line = np.vstack([center + direction * float(np.min(proj)), center + direction * float(np.max(proj))])
+    return line, True
+
+
+def recovery_stroke_endpoints(stroke, straightness_threshold=0.9, resample_step=15.0):
+    line_points, is_curved = simplify_stroke_points(
+        stroke,
+        straightness_threshold=straightness_threshold,
+        resample_step=resample_step,
+    )
+    return line_points[0], line_points[1], is_curved
+
+
+def recovery_stroke_polyline(stroke, straightness_threshold=0.9, resample_step=15.0):
+    points = np.asarray(stroke.get("points", [stroke["p0"], stroke["p1"]]), dtype=float)
+    straightness = float(stroke.get("straightness", 1.0))
+    if len(points) < 2:
+        return np.vstack([stroke["p0"], stroke["p1"]]), False
+    if straightness >= float(straightness_threshold):
+        return np.vstack([points[0], points[-1]]), False
+    polyline = resample_polyline_by_step(points, step=resample_step)
+    if len(polyline) < 2:
+        return np.vstack([points[0], points[-1]]), False
+    polyline[0] = points[0]
+    polyline[-1] = points[-1]
+    return polyline, True
+
+
+def orient_cap_stroke_polyline(polyline, start_group, end_group, desired_start_group=None, previous_point=None):
+    poly = np.asarray(polyline, dtype=float)
+    if desired_start_group is not None:
+        if start_group == desired_start_group and end_group != desired_start_group:
+            return poly, start_group, end_group
+        if end_group == desired_start_group and start_group != desired_start_group:
+            return poly[::-1].copy(), end_group, start_group
+    if previous_point is not None:
+        previous_point = np.asarray(previous_point, dtype=float)
+        if norm(poly[0] - previous_point) <= norm(poly[-1] - previous_point):
+            return poly, start_group, end_group
+        return poly[::-1].copy(), end_group, start_group
+    return poly, start_group, end_group
+
+
+def build_cap_stroke_loop_items(cap_endpoint_source, strokes, straightness_threshold=0.9, resample_step=15.0):
+    if not cap_endpoint_source or strokes is None:
+        return []
+    stroke_order = [
+        int(s)
+        for s in cap_endpoint_source.get("component_strokes_in_order", cap_endpoint_source.get("pruned_strokes", []))
+        if int(s) in strokes
+    ]
+    if not stroke_order:
+        return []
+
+    stroke_groups = cap_endpoint_source.get("stroke_group_indices", {})
+    items = []
+    previous_end_group = None
+    previous_end_point = None
+    for idx, sid in enumerate(stroke_order):
+        group_info = stroke_groups.get(str(int(sid)))
+        if group_info is None:
+            continue
+        polyline_2d, is_curved = recovery_stroke_polyline(
+            strokes[sid],
+            straightness_threshold=straightness_threshold,
+            resample_step=resample_step,
+        )
+        start_group = int(group_info["start"])
+        end_group = int(group_info["end"])
+        if idx == 0 and len(stroke_order) > 1:
+            next_group_info = stroke_groups.get(str(int(stroke_order[1])))
+            if next_group_info is not None:
+                next_groups = {int(next_group_info["start"]), int(next_group_info["end"])}
+                if start_group in next_groups and end_group not in next_groups:
+                    polyline_2d = polyline_2d[::-1].copy()
+                    start_group, end_group = end_group, start_group
+        polyline_2d, start_group, end_group = orient_cap_stroke_polyline(
+            polyline_2d,
+            start_group,
+            end_group,
+            desired_start_group=previous_end_group,
+            previous_point=previous_end_point,
+        )
+        previous_end_group = end_group
+        previous_end_point = polyline_2d[-1]
+        items.append(
+            {
+                "stroke": int(sid),
+                "straightness": float(strokes[sid].get("straightness", 1.0)),
+                "is_curved": bool(is_curved),
+                "start_group_index": int(start_group),
+                "end_group_index": int(end_group),
+                "polyline_2d": polyline_2d,
+            }
+        )
+    return items
+
+
+def normalize_cap_stroke_loop_items(cap_stroke_loop_items, strokes, straightness_threshold=0.9, resample_step=15.0):
+    if not cap_stroke_loop_items or strokes is None:
+        return cap_stroke_loop_items
+    normalized = []
+    for item in cap_stroke_loop_items:
+        sid = int(item["stroke"])
+        polyline_2d = np.asarray(item["polyline_2d"], dtype=float)
+        normalized_item = dict(item)
+        stroke = strokes.get(sid)
+        if stroke is not None:
+            recomputed_polyline, recomputed_is_curved = recovery_stroke_polyline(
+                stroke,
+                straightness_threshold=straightness_threshold,
+                resample_step=resample_step,
+            )
+            recomputed_polyline = np.asarray(recomputed_polyline, dtype=float)
+            if recomputed_is_curved and len(recomputed_polyline) > len(polyline_2d):
+                if len(polyline_2d) >= 2:
+                    same_dir = norm(recomputed_polyline[0] - polyline_2d[0]) + norm(recomputed_polyline[-1] - polyline_2d[-1])
+                    flip_dir = norm(recomputed_polyline[0] - polyline_2d[-1]) + norm(recomputed_polyline[-1] - polyline_2d[0])
+                    if flip_dir < same_dir:
+                        recomputed_polyline = recomputed_polyline[::-1].copy()
+                normalized_item["polyline_2d"] = recomputed_polyline
+                normalized_item["is_curved"] = True
+        normalized.append(normalized_item)
+    return normalized
+
+
+def reverse_cap_stroke_loop_item(item):
+    reversed_item = dict(item)
+    reversed_item["polyline_2d"] = np.asarray(item["polyline_2d"], dtype=float)[::-1].copy()
+    reversed_item["start_group_index"] = int(item["end_group_index"])
+    reversed_item["end_group_index"] = int(item["start_group_index"])
+    return reversed_item
+
+
+def component_is_simple_closed_loop(cap_stroke_loop_items):
+    if not cap_stroke_loop_items:
+        return False
+    degree = {}
+    for item in cap_stroke_loop_items:
+        a = int(item["start_group_index"])
+        b = int(item["end_group_index"])
+        if a == b:
+            degree[a] = degree.get(a, 0) + 2
+            continue
+        degree[a] = degree.get(a, 0) + 1
+        degree[b] = degree.get(b, 0) + 1
+    return bool(degree) and all(v == 2 for v in degree.values())
+
+
+def order_cap_stroke_loop_items(cap_stroke_loop_items):
+    if len(cap_stroke_loop_items) <= 1:
+        return cap_stroke_loop_items
+    if not component_is_simple_closed_loop(cap_stroke_loop_items):
+        return cap_stroke_loop_items
+
+    indexed_items = [(idx, item) for idx, item in enumerate(cap_stroke_loop_items)]
+    node_to_items = {}
+    for idx, item in indexed_items:
+        node_to_items.setdefault(int(item["start_group_index"]), []).append(idx)
+        node_to_items.setdefault(int(item["end_group_index"]), []).append(idx)
+
+    start_idx = 0
+    start_item = cap_stroke_loop_items[start_idx]
+
+    def attempt(first_item):
+        ordered = [first_item]
+        used = {start_idx}
+        start_group = int(first_item["start_group_index"])
+        current_group = int(first_item["end_group_index"])
+        while len(ordered) < len(cap_stroke_loop_items):
+            candidates = [idx for idx in node_to_items.get(current_group, []) if idx not in used]
+            if not candidates:
+                return None
+            next_idx = min(candidates)
+            next_item = cap_stroke_loop_items[next_idx]
+            if int(next_item["start_group_index"]) == current_group:
+                oriented = next_item
+            elif int(next_item["end_group_index"]) == current_group:
+                oriented = reverse_cap_stroke_loop_item(next_item)
+            else:
+                return None
+            ordered.append(oriented)
+            used.add(next_idx)
+            current_group = int(oriented["end_group_index"])
+        if current_group != start_group:
+            return None
+        return ordered
+
+    ordered = attempt(start_item)
+    if ordered is not None:
+        return ordered
+    reversed_start = reverse_cap_stroke_loop_item(start_item)
+    ordered = attempt(reversed_start)
+    return ordered if ordered is not None else cap_stroke_loop_items
+
+
+def flatten_cap_stroke_loop_polyline_points(cap_stroke_loop_items):
+    flat_points = []
+    for item_idx, item in enumerate(cap_stroke_loop_items):
+        poly = np.asarray(item["polyline_2d"], dtype=float)
+        if len(poly) == 0:
+            continue
+        for point_idx, point in enumerate(poly):
+            if flat_points and point_idx == 0 and points_close_2d(flat_points[-1], point):
+                continue
+            if (
+                item_idx == len(cap_stroke_loop_items) - 1
+                and point_idx == len(poly) - 1
+                and flat_points
+                and points_close_2d(flat_points[0], point)
+            ):
+                continue
+            flat_points.append(np.asarray(point, dtype=float))
+    return flat_points
+
+
+def polygon_signed_area_2d(points):
+    if len(points) < 3:
+        return 0.0
+    area2 = 0.0
+    for idx in range(len(points)):
+        p = np.asarray(points[idx], dtype=float)
+        q = np.asarray(points[(idx + 1) % len(points)], dtype=float)
+        area2 += float(p[0] * q[1] - q[0] * p[1])
+    return 0.5 * area2
+
+
+def orient2d(a, b, c):
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    c = np.asarray(c, dtype=float)
+    return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+
+
+def point_on_segment_2d(point, a, b, tol=1e-6):
+    point = np.asarray(point, dtype=float)
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if abs(orient2d(a, b, point)) > tol:
+        return False
+    min_x, max_x = sorted((float(a[0]), float(b[0])))
+    min_y, max_y = sorted((float(a[1]), float(b[1])))
+    return (
+        min_x - tol <= float(point[0]) <= max_x + tol
+        and min_y - tol <= float(point[1]) <= max_y + tol
+    )
+
+
+def segments_intersect_2d(a0, a1, b0, b1, tol=1e-6):
+    if (
+        points_close_2d(a0, b0, tol)
+        or points_close_2d(a0, b1, tol)
+        or points_close_2d(a1, b0, tol)
+        or points_close_2d(a1, b1, tol)
+    ):
+        return False
+    o1 = orient2d(a0, a1, b0)
+    o2 = orient2d(a0, a1, b1)
+    o3 = orient2d(b0, b1, a0)
+    o4 = orient2d(b0, b1, a1)
+    if ((o1 > tol and o2 < -tol) or (o1 < -tol and o2 > tol)) and ((o3 > tol and o4 < -tol) or (o3 < -tol and o4 > tol)):
+        return True
+    if abs(o1) <= tol and point_on_segment_2d(b0, a0, a1, tol):
+        return True
+    if abs(o2) <= tol and point_on_segment_2d(b1, a0, a1, tol):
+        return True
+    if abs(o3) <= tol and point_on_segment_2d(a0, b0, b1, tol):
+        return True
+    if abs(o4) <= tol and point_on_segment_2d(a1, b0, b1, tol):
+        return True
+    return False
+
+
+def find_polyline_loop_self_intersections(points):
+    count = len(points)
+    if count < 4:
+        return []
+    intersections = []
+    segments = [(points[idx], points[(idx + 1) % count]) for idx in range(count)]
+    for i in range(count):
+        a0, a1 = segments[i]
+        for j in range(i + 1, count):
+            if j == i:
+                continue
+            if j == (i + 1) % count or i == (j + 1) % count:
+                continue
+            if i == 0 and j == count - 1:
+                continue
+            b0, b1 = segments[j]
+            if segments_intersect_2d(a0, a1, b0, b1):
+                intersections.append([int(i), int(j)])
+    return intersections
+
+
+def evaluate_cap_stroke_loop_order(cap_stroke_loop_items):
+    points = flatten_cap_stroke_loop_polyline_points(cap_stroke_loop_items)
+    endpoint_gap_sum = 0.0
+    max_endpoint_gap = 0.0
+    if cap_stroke_loop_items:
+        for idx, item in enumerate(cap_stroke_loop_items):
+            current_end = np.asarray(item["polyline_2d"], dtype=float)[-1]
+            next_start = np.asarray(cap_stroke_loop_items[(idx + 1) % len(cap_stroke_loop_items)]["polyline_2d"], dtype=float)[0]
+            gap = norm(current_end - next_start)
+            endpoint_gap_sum += gap
+            max_endpoint_gap = max(max_endpoint_gap, float(gap))
+    intersections = find_polyline_loop_self_intersections(points)
+    area = polygon_signed_area_2d(points)
+    return {
+        "flat_point_count": int(len(points)),
+        "self_intersection_pairs": intersections,
+        "self_intersection_count": int(len(intersections)),
+        "endpoint_gap_sum": float(endpoint_gap_sum),
+        "max_endpoint_gap": float(max_endpoint_gap),
+        "signed_area": float(area),
+        "abs_area": float(abs(area)),
+        "stroke_order": [int(item["stroke"]) for item in cap_stroke_loop_items],
+    }
+
+
+def apply_two_opt_to_cap_stroke_loop_items(cap_stroke_loop_items, i, j):
+    if i < 0 or j >= len(cap_stroke_loop_items) or i >= j:
+        return list(cap_stroke_loop_items)
+    middle = [reverse_cap_stroke_loop_item(item) for item in reversed(cap_stroke_loop_items[i : j + 1])]
+    return list(cap_stroke_loop_items[:i]) + middle + list(cap_stroke_loop_items[j + 1 :])
+
+
+def cap_loop_order_score(metrics):
+    return (
+        int(metrics["self_intersection_count"]),
+        int(round(metrics["max_endpoint_gap"] * 1000.0)),
+        int(round(metrics["endpoint_gap_sum"] * 1000.0)),
+        -int(round(metrics["abs_area"])),
+    )
+
+
+def repair_cap_stroke_loop_order(cap_stroke_loop_items, max_passes=32):
+    current = list(cap_stroke_loop_items)
+    before = evaluate_cap_stroke_loop_order(current)
+    passes = 0
+    changed = False
+    while passes < max_passes:
+        passes += 1
+        current_metrics = evaluate_cap_stroke_loop_order(current)
+        best_items = current
+        best_metrics = current_metrics
+        improved = False
+        for i in range(1, max(len(current) - 1, 1)):
+            for j in range(i + 1, len(current)):
+                candidate = apply_two_opt_to_cap_stroke_loop_items(current, i, j)
+                candidate_metrics = evaluate_cap_stroke_loop_order(candidate)
+                if cap_loop_order_score(candidate_metrics) < cap_loop_order_score(best_metrics):
+                    best_items = candidate
+                    best_metrics = candidate_metrics
+                    improved = True
+        if not improved:
+            break
+        current = best_items
+        changed = True
+        if best_metrics["self_intersection_count"] == 0 and best_metrics["max_endpoint_gap"] <= 1e-5:
+            break
+    after = evaluate_cap_stroke_loop_order(current)
+    return current, {
+        "changed": bool(changed),
+        "two_opt_passes": int(passes),
+        "before": before,
+        "after": after,
+    }
+
+
+def validate_cap_stroke_loop_order(cap_stroke_loop_items):
+    ordered = order_cap_stroke_loop_items(cap_stroke_loop_items)
+    repaired, repair_debug = repair_cap_stroke_loop_order(ordered)
+    return repaired, repair_debug
+
+
+def project_polyline_min_norm(polyline_2d, cal):
+    return [pixel_to_world_min_norm(point, cal) for point in np.asarray(polyline_2d, dtype=float)]
+
+
+def project_polyline_to_plane(polyline_2d, plane_point, plane_normal, cal):
+    return [intersect_pixel_with_plane(point, plane_point, plane_normal, cal) for point in np.asarray(polyline_2d, dtype=float)]
+
+
+def project_polyline_to_z(polyline_2d, z_value, cal):
+    return [pixel_to_world_on_z(point, z_value, cal) for point in np.asarray(polyline_2d, dtype=float)]
+
+
+def group_cap_endpoints(strokes, cap_ids, tol, straightness_threshold=0.9, resample_step=15.0):
     groups = []
     for sid in cap_ids:
+        if sid in strokes:
+            polyline_2d, _ = recovery_stroke_polyline(
+                strokes[sid],
+                straightness_threshold=straightness_threshold,
+                resample_step=resample_step,
+            )
+            p0, p1 = polyline_2d[0], polyline_2d[-1]
+            endpoint_pixels = {"p0": p0, "p1": p1}
+        else:
+            endpoint_pixels = {"p0": strokes[sid]["p0"], "p1": strokes[sid]["p1"]}
         for endpoint_name in ("p0", "p1"):
-            point = strokes[sid][endpoint_name]
+            point = endpoint_pixels[endpoint_name]
             best_i = None
             best_d = float("inf")
             for i, group in enumerate(groups):
@@ -1257,24 +1748,34 @@ def min_distance_to_cap(point, cap_groups):
     return min(norm(point - g["center"]) for g in cap_groups)
 
 
-def orient_side_stroke(stroke, cap_groups):
-    d0 = min_distance_to_cap(stroke["p0"], cap_groups)
-    d1 = min_distance_to_cap(stroke["p1"], cap_groups)
+def orient_side_stroke(stroke, cap_groups, straightness_threshold=0.9, resample_step=15.0):
+    polyline_2d, is_curved = recovery_stroke_polyline(
+        stroke,
+        straightness_threshold=straightness_threshold,
+        resample_step=resample_step,
+    )
+    p0, p1 = polyline_2d[0], polyline_2d[-1]
+    d0 = min_distance_to_cap(p0, cap_groups)
+    d1 = min_distance_to_cap(p1, cap_groups)
     if d0 <= d1:
         near_name, far_name = "p0", "p1"
+        near_pixel, far_pixel = p0, p1
     else:
         near_name, far_name = "p1", "p0"
+        near_pixel, far_pixel = p1, p0
     return {
         "stroke": stroke["id"],
         "near_endpoint": near_name,
         "far_endpoint": far_name,
-        "near_pixel": stroke[near_name],
-        "far_pixel": stroke[far_name],
+        "near_pixel": near_pixel,
+        "far_pixel": far_pixel,
         "near_distance_to_source_cap": min(d0, d1),
         "far_distance_to_source_cap": max(d0, d1),
-        "vector_pixel": stroke[far_name] - stroke[near_name],
-        "chord": stroke["chord"],
+        "vector_pixel": far_pixel - near_pixel,
+        "chord": norm(far_pixel - near_pixel),
         "arc": stroke["arc"],
+        "straightness": float(stroke.get("straightness", 1.0)),
+        "is_curved": bool(is_curved),
     }
 
 
@@ -1481,6 +1982,153 @@ def save_cap_endpoint_graph_debug_png(cap_groups, output_path, image_shape_hw, g
     cv2.imwrite(str(output_path), canvas)
 
 
+def points_close_2d(a, b, tol=1e-5):
+    return norm(np.asarray(a, dtype=float) - np.asarray(b, dtype=float)) <= tol
+
+
+def flatten_stroke_loop_points_2d(stroke_loop, key):
+    flat_points = []
+    stroke_items = []
+    total = len(stroke_loop)
+    for item_idx, item in enumerate(stroke_loop):
+        poly = np.asarray(item[f"{key}_polyline_2d"], dtype=float)
+        if len(poly) == 0:
+            continue
+        point_indices = []
+        for point_idx, point in enumerate(poly):
+            if flat_points and point_idx == 0 and points_close_2d(flat_points[-1], point):
+                point_indices.append(len(flat_points) - 1)
+                continue
+            if (
+                item_idx == total - 1
+                and point_idx == len(poly) - 1
+                and flat_points
+                and points_close_2d(flat_points[0], point)
+            ):
+                point_indices.append(0)
+                continue
+            flat_points.append(np.asarray(point, dtype=float))
+            point_indices.append(len(flat_points) - 1)
+        stroke_items.append(
+            {
+                "stroke": int(item["stroke"]),
+                "is_curved": bool(item.get("is_curved", False) or len(poly) > 2),
+                "straightness": float(item.get("straightness", 1.0)),
+                "polyline_point_count": int(len(poly)),
+                "point_indices": point_indices,
+            }
+        )
+    return flat_points, stroke_items
+
+
+def closed_loop_edges(point_count):
+    if point_count < 2:
+        return []
+    return [[idx, (idx + 1) % point_count] for idx in range(point_count)]
+
+
+def save_blender_cap_debug_outputs(
+    result,
+    png_path,
+    json_path,
+    image_shape_hw,
+):
+    cap_stroke_loop = result.get("cap_stroke_loop") or []
+    source_groups = result.get("source_cap_endpoint_groups") or []
+    copied_offset = np.array(
+        result.get("copied_cap_offset_from_primary_side", {}).get("vector_pixel", [0.0, 0.0]),
+        dtype=float,
+    )
+
+    mode = "endpoint_loop"
+    source_strokes = []
+    copied_strokes = []
+    if cap_stroke_loop:
+        mode = "polyline_loop"
+        source_points, source_strokes = flatten_stroke_loop_points_2d(cap_stroke_loop, "source")
+        copied_points, copied_strokes = flatten_stroke_loop_points_2d(cap_stroke_loop, "copied")
+    else:
+        source_points = [np.array(g["source_cap"]["pixel_top_left"], dtype=float) for g in source_groups]
+        copied_points = [np.array(g["copied_cap"]["pixel_top_left"], dtype=float) for g in source_groups]
+
+    source_edges = closed_loop_edges(len(source_points))
+    copied_edges = closed_loop_edges(len(copied_points))
+
+    payload = {
+        "mode": mode,
+        "source_loop_points_2d": [to_list(p) for p in source_points],
+        "copied_loop_points_2d": [to_list(p) for p in copied_points],
+        "source_loop_edges": source_edges,
+        "copied_loop_edges": copied_edges,
+        "source_loop_strokes": source_strokes,
+        "copied_loop_strokes": copied_strokes,
+        "copied_offset_vector_pixel": to_list(copied_offset),
+        "cap_loop_order_debug": result.get("cap_loop_order_debug"),
+    }
+    write_debug_json(json_path, payload)
+
+    try:
+        import cv2
+    except ModuleNotFoundError:
+        return payload
+
+    h, w = int(image_shape_hw[0]), int(image_shape_hw[1])
+    canvas = np.full((h, w, 3), 255, dtype=np.uint8)
+
+    def draw_edges(points, edges, color):
+        for a, b in edges:
+            if a >= len(points) or b >= len(points):
+                continue
+            pa = tuple(np.round(points[a]).astype(int))
+            pb = tuple(np.round(points[b]).astype(int))
+            cv2.line(canvas, pa, pb, color, 2, cv2.LINE_AA)
+
+    def draw_points(points, prefix, color):
+        for idx, point in enumerate(points):
+            p = tuple(np.round(point).astype(int))
+            cv2.circle(canvas, p, 4, color, -1, cv2.LINE_AA)
+            cv2.putText(
+                canvas,
+                f"{prefix}{idx}",
+                (int(p[0]) + 4, int(p[1]) - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+    draw_edges(source_points, source_edges, (0, 160, 0))
+    draw_edges(copied_points, copied_edges, (200, 80, 0))
+    draw_points(source_points, "S", (0, 180, 0))
+    draw_points(copied_points, "C", (255, 120, 0))
+
+    cv2.putText(
+        canvas,
+        f"Blender cap input ({mode})",
+        (15, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 0, 0),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        "green=source cap, orange=copied cap",
+        (15, 54),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (0, 0, 0),
+        1,
+        cv2.LINE_AA,
+    )
+    png_path = Path(png_path)
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(png_path), canvas)
+    return payload
+
+
 def write_blender_reconstruction_script(json_path, blend_output, solid_blend_output, render_output, script_output):
     script = f"""
 import json
@@ -1583,6 +2231,18 @@ def world(item, key):
     return item[key].get("world_on_obj_cap_plane", item[key].get("world_on_gt_cap_plane", item[key]["world_min_norm"]))
 
 
+def world_polyline(item, key):
+    if key == "source":
+        return item.get(
+            "source_polyline_world_on_obj_cap_plane",
+            item.get("source_polyline_world_on_gt_cap_plane", item["source_polyline_world_min_norm"]),
+        )
+    return item.get(
+        "copied_polyline_world_on_obj_cap_plane",
+        item.get("copied_polyline_world_on_gt_cap_plane", item["copied_polyline_world_min_norm"]),
+    )
+
+
 def first_vector(*values):
     for value in values:
         if value is not None:
@@ -1642,6 +2302,25 @@ def loop_order_from_edges(edges, point_count):
     raise RuntimeError(f"Could not trace a single cap loop from graph edges: {{edges}}")
 
 
+def points_close(a, b, tol=1e-5):
+    return (Vector(a) - Vector(b)).length <= tol
+
+
+def flatten_stroke_loop_points(stroke_loop, key):
+    out = []
+    for item in stroke_loop:
+        poly = [Vector(p)[:] for p in world_polyline(item, key)]
+        if not poly:
+            continue
+        if out and points_close(out[-1], poly[0]):
+            out.extend(poly[1:])
+        else:
+            out.extend(poly)
+    if len(out) >= 2 and points_close(out[0], out[-1]):
+        out.pop()
+    return out
+
+
 def add_extruded_volume(name, source_points, copied_points, graph_edges, material=None):
     loop_order = loop_order_from_edges(graph_edges, len(source_points))
     if len(loop_order) < 3:
@@ -1669,6 +2348,34 @@ def add_extruded_volume(name, source_points, copied_points, graph_edges, materia
     return obj, loop_order
 
 
+def add_extruded_volume_from_polyline_loop(name, source_loop_points, copied_loop_points, material=None):
+    if len(source_loop_points) < 3 or len(copied_loop_points) < 3:
+        raise RuntimeError("Need at least three polyline points to create a curved surface.")
+    if len(source_loop_points) != len(copied_loop_points):
+        raise RuntimeError("Source/copied polyline loops must have the same point count.")
+
+    verts = [Vector(p)[:] for p in source_loop_points]
+    verts += [Vector(p)[:] for p in copied_loop_points]
+    n = len(source_loop_points)
+
+    source_face = list(range(n))
+    copied_face = list(range(2 * n - 1, n - 1, -1))
+    side_faces = [
+        [idx, (idx + 1) % n, n + ((idx + 1) % n), n + idx]
+        for idx in range(n)
+    ]
+
+    mesh = bpy.data.meshes.new(name + "_mesh")
+    mesh.from_pydata(verts, [], [source_face, copied_face] + side_faces)
+    mesh.update(calc_edges=True)
+
+    obj = bpy.data.objects.new(name, mesh)
+    bpy.context.collection.objects.link(obj)
+    if material is not None:
+        obj.data.materials.append(material)
+    return obj, list(range(n))
+
+
 def main():
     data = json.loads(JSON_PATH.read_text(encoding="utf-8"))
     clear_scene()
@@ -1681,8 +2388,11 @@ def main():
     gray = make_material("cap_pair_gray", (0.35, 0.35, 0.35, 1.0))
 
     groups = data["source_cap_endpoint_groups"]
+    cap_stroke_loop = data.get("cap_stroke_loop") or []
     source_points = [world(g, "source_cap") for g in groups]
     copied_points = [world(g, "copied_cap") for g in groups]
+    source_loop_points = flatten_stroke_loop_points(cap_stroke_loop, "source") if cap_stroke_loop else source_points
+    copied_loop_points = flatten_stroke_loop_points(cap_stroke_loop, "copied") if cap_stroke_loop else copied_points
     side_near = [
         s.get("near_world_on_obj_cap_plane", s.get("near_world_on_gt_cap_plane", s["near_world_min_norm"]))
         for s in data["side_strokes_oriented_near_to_far"]
@@ -1692,7 +2402,7 @@ def main():
         for s in data["side_strokes_oriented_near_to_far"]
     ]
 
-    all_points = source_points + copied_points + side_near + side_far
+    all_points = source_loop_points + copied_loop_points + side_near + side_far
     fit_camera(all_points)
 
     for idx, group in enumerate(groups):
@@ -1705,7 +2415,27 @@ def main():
         add_text(f"copied_label_{{idx:02d}}", f"C{{idx}}", Vector(cp) + Vector((0, 0, 0.22)), 0.18, black)
 
     graph_edges = data.get("cap_endpoint_source", {{}}).get("graph_edges_group_indices") or []
-    if graph_edges:
+    if cap_stroke_loop:
+        for item in cap_stroke_loop:
+            source_poly = world_polyline(item, "source")
+            copied_poly = world_polyline(item, "copied")
+            for edge_idx in range(len(source_poly) - 1):
+                add_cylinder_between(
+                    f"source_cap_polyline_{{item['stroke']}}_{{edge_idx:02d}}",
+                    source_poly[edge_idx],
+                    source_poly[edge_idx + 1],
+                    0.03,
+                    green,
+                )
+            for edge_idx in range(len(copied_poly) - 1):
+                add_cylinder_between(
+                    f"copied_cap_polyline_{{item['stroke']}}_{{edge_idx:02d}}",
+                    copied_poly[edge_idx],
+                    copied_poly[edge_idx + 1],
+                    0.03,
+                    blue,
+                )
+    elif graph_edges:
         for edge_idx, (a, b) in enumerate(graph_edges):
             if a >= len(source_points) or b >= len(source_points):
                 continue
@@ -1776,13 +2506,21 @@ def main():
 
     clear_scene()
     clear_non_object_data()
-    solid_obj, loop_order = add_extruded_volume(
-        "reconstructed_cap_loop_extruded_solid",
-        source_points,
-        copied_points,
-        graph_edges,
-        None,
-    )
+    if cap_stroke_loop:
+        solid_obj, loop_order = add_extruded_volume_from_polyline_loop(
+            "reconstructed_cap_loop_extruded_solid",
+            source_loop_points,
+            copied_loop_points,
+            None,
+        )
+    else:
+        solid_obj, loop_order = add_extruded_volume(
+            "reconstructed_cap_loop_extruded_solid",
+            source_points,
+            copied_points,
+            graph_edges,
+            None,
+        )
     SOLID_BLEND_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(SOLID_BLEND_OUTPUT))
 
@@ -1842,6 +2580,16 @@ def main():
         help="Debug PNG showing cap endpoint coordinates read from cap_endpoint_graph_summary.txt.",
     )
     parser.add_argument(
+        "--blender-cap-debug-png",
+        default="debug/blender_reconstruction_cap_2d.png",
+        help="2D PNG debug view of the cap loop points/edges that are fed into Blender reconstruction.",
+    )
+    parser.add_argument(
+        "--blender-cap-debug-json",
+        default="debug/blender_reconstruction_cap_2d.json",
+        help="JSON debug file with cap loop points and connectivity used for Blender reconstruction.",
+    )
+    parser.add_argument(
         "--endpoint-group-tol",
         type=float,
         default=15.0,
@@ -1884,6 +2632,18 @@ def main():
         help="Maximum unoriented angle between a candidate copy side stroke and the side majority direction.",
     )
     parser.add_argument(
+        "--curve-straightness-thresh",
+        type=float,
+        default=0.9,
+        help="Treat strokes with straightness below this threshold as curved during 3D recovery.",
+    )
+    parser.add_argument(
+        "--curve-resample-step-px",
+        type=float,
+        default=15.0,
+        help="Arc-length step, in pixels, used to resample curved 2D strokes before straight-line simplification.",
+    )
+    parser.add_argument(
         "--reconstruct-blender",
         action="store_true",
         help="Use Blender to rebuild a 3D scene from the generated endpoint JSON.",
@@ -1921,6 +2681,7 @@ def main():
     selected_iou = None
     selected = None
     primary_side = {"stroke": -1, "near_endpoint": "overlay_source_cap", "far_endpoint": "overlay_copied_cap"}
+    strokes = None
     if args.endpoint_source == "overlay":
         overlay_image = Path(args.overlay_image) if args.overlay_image else find_default_overlay_image(debug_dir, args.rank)
         if overlay_image is None or not overlay_image.exists():
@@ -1936,7 +2697,9 @@ def main():
                 selected_iou = None
         oriented_sides = []
     else:
-        strokes = load_strokes(debug_dir / "05a_stroke_directions.txt")
+        strokes = load_strokes_json(debug_dir / "05a_stroke_directions.json")
+        if strokes is None:
+            strokes = load_strokes(debug_dir / "05a_stroke_directions.txt")
         clusters = load_cluster_entries(debug_dir / "cluster_side_caps" / "cluster_side_cap_summary.txt")
         if args.overlay:
             selected_iou = parse_overlay_name(args.overlay)
@@ -1972,9 +2735,18 @@ def main():
             selected["cluster"],
             selected["best_cap_strokes"],
             args.endpoint_group_tol,
+            strokes=strokes,
+            straightness_threshold=args.curve_straightness_thresh,
+            resample_step=args.curve_resample_step_px,
         )
         if cap_groups is None:
-            cap_groups = group_cap_endpoints(strokes, selected["best_cap_strokes"], args.endpoint_group_tol)
+            cap_groups = group_cap_endpoints(
+                strokes,
+                selected["best_cap_strokes"],
+                args.endpoint_group_tol,
+                straightness_threshold=args.curve_straightness_thresh,
+                resample_step=args.curve_resample_step_px,
+            )
             cap_endpoint_source = {
                 "source": str(debug_dir / "05a_stroke_directions.txt"),
                 "fallback_reason": cap_endpoint_source,
@@ -1993,7 +2765,15 @@ def main():
             cap_endpoint_source.get("graph_edges_group_indices"),
         )
         cap_endpoint_source["debug_png"] = str(endpoint_debug_output)
-        oriented_sides = [orient_side_stroke(strokes[sid], cap_groups) for sid in selected["side"]]
+        oriented_sides = [
+            orient_side_stroke(
+                strokes[sid],
+                cap_groups,
+                straightness_threshold=args.curve_straightness_thresh,
+                resample_step=args.curve_resample_step_px,
+            )
+            for sid in selected["side"]
+        ]
         primary_side = choose_primary_side_by_preselected_stroke(
             oriented_sides,
             selected.get("copy_side_stroke"),
@@ -2124,6 +2904,66 @@ def main():
             item["unit_world_on_obj_cap_planes"] = to_list(unit(far_obj - near_obj))
         side_json.append(item)
 
+    cap_stroke_loop_json = []
+    cap_stroke_loop_items = build_cap_stroke_loop_items(
+        cap_endpoint_source,
+        strokes,
+        straightness_threshold=args.curve_straightness_thresh,
+        resample_step=args.curve_resample_step_px,
+    )
+    cap_stroke_loop_items = normalize_cap_stroke_loop_items(
+        cap_stroke_loop_items,
+        strokes,
+        straightness_threshold=args.curve_straightness_thresh,
+        resample_step=args.curve_resample_step_px,
+    )
+    cap_stroke_loop_items, cap_loop_order_debug = validate_cap_stroke_loop_order(cap_stroke_loop_items)
+    for item in cap_stroke_loop_items:
+        source_polyline_2d = np.asarray(item["polyline_2d"], dtype=float)
+        copied_polyline_2d = source_polyline_2d + np.asarray(copied_offset, dtype=float)
+        loop_item = {
+            "stroke": int(item["stroke"]),
+            "straightness": float(item["straightness"]),
+            "is_curved": bool(item["is_curved"]),
+            "polyline_point_count": int(len(source_polyline_2d)),
+            "start_group_index": int(item["start_group_index"]),
+            "end_group_index": int(item["end_group_index"]),
+            "source_polyline_2d": [to_list(p) for p in source_polyline_2d],
+            "copied_polyline_2d": [to_list(p) for p in copied_polyline_2d],
+            "source_polyline_world_min_norm": [to_list(p) for p in project_polyline_min_norm(source_polyline_2d, cal)],
+            "copied_polyline_world_min_norm": [to_list(p) for p in project_polyline_min_norm(copied_polyline_2d, cal)],
+        }
+        if gt_assignment is not None:
+            if "detected_source_plane_point" in gt_assignment:
+                source_plane_point = np.array(gt_assignment["detected_source_plane_point"], dtype=float)
+                source_plane_normal = np.array(gt_assignment["detected_source_plane_normal"], dtype=float)
+                copied_plane_point = np.array(gt_assignment["detected_copied_plane_point"], dtype=float)
+                copied_plane_normal = np.array(gt_assignment["detected_copied_plane_normal"], dtype=float)
+                loop_item["source_polyline_world_on_gt_cap_plane"] = [
+                    to_list(p) for p in project_polyline_to_plane(source_polyline_2d, source_plane_point, source_plane_normal, cal)
+                ]
+                loop_item["copied_polyline_world_on_gt_cap_plane"] = [
+                    to_list(p) for p in project_polyline_to_plane(copied_polyline_2d, copied_plane_point, copied_plane_normal, cal)
+                ]
+            else:
+                loop_item["source_polyline_world_on_gt_cap_plane"] = [
+                    to_list(p) for p in project_polyline_to_z(source_polyline_2d, gt_assignment["detected_source_z"], cal)
+                ]
+                loop_item["copied_polyline_world_on_gt_cap_plane"] = [
+                    to_list(p) for p in project_polyline_to_z(copied_polyline_2d, gt_assignment["detected_copied_z"], cal)
+                ]
+        if obj_assignment is not None:
+            source_plane_point = np.array(obj_assignment["source_plane_point"], dtype=float)
+            copied_plane_point = np.array(obj_assignment["copied_plane_point"], dtype=float)
+            plane_normal = np.array(obj_assignment["plane_normal_source_to_copied"], dtype=float)
+            loop_item["source_polyline_world_on_obj_cap_plane"] = [
+                to_list(p) for p in project_polyline_to_plane(source_polyline_2d, source_plane_point, plane_normal, cal)
+            ]
+            loop_item["copied_polyline_world_on_obj_cap_plane"] = [
+                to_list(p) for p in project_polyline_to_plane(copied_polyline_2d, copied_plane_point, plane_normal, cal)
+            ]
+        cap_stroke_loop_json.append(loop_item)
+
     result = {
         "note": (
             "2D orthographic back-projection is not unique. world_min_norm uses the Moore-Penrose "
@@ -2147,8 +2987,11 @@ def main():
         "obj_cap_plane_assignment": obj_assignment,
         "obj_cap_plane_assignment_error": obj_assignment_error,
         "source_cap_endpoint_groups": [
-            cap_group_to_json(group, copied_offset, cal, gt_assignment, obj_assignment) for group in cap_groups
+            cap_group_to_json(group, copied_offset, cal, gt_assignment, obj_assignment)
+            for group in cap_groups
         ],
+        "cap_stroke_loop": cap_stroke_loop_json,
+        "cap_loop_order_debug": cap_loop_order_debug,
         "copied_cap_offset_from_primary_side": {
             "stroke": int(primary_side["stroke"]),
             "near_endpoint": primary_side["near_endpoint"],
@@ -2178,6 +3021,27 @@ def main():
             "primary_from_obj_cap_plane_vector_world": to_list(primary_obj_vector) if primary_obj_vector is not None else None,
         },
         "side_strokes_oriented_near_to_far": side_json,
+    }
+
+    render = cal["raw"].get("render", {})
+    blender_cap_debug_png = Path(args.blender_cap_debug_png)
+    if not blender_cap_debug_png.is_absolute():
+        blender_cap_debug_png = Path.cwd() / blender_cap_debug_png
+    blender_cap_debug_json = Path(args.blender_cap_debug_json)
+    if not blender_cap_debug_json.is_absolute():
+        blender_cap_debug_json = Path.cwd() / blender_cap_debug_json
+    save_blender_cap_debug_outputs(
+        result,
+        blender_cap_debug_png,
+        blender_cap_debug_json,
+        (
+            int(render.get("resolution_y", 1000)),
+            int(render.get("resolution_x", 1400)),
+        ),
+    )
+    result["blender_cap_debug"] = {
+        "png": str(blender_cap_debug_png),
+        "json": str(blender_cap_debug_json),
     }
 
     output_path = Path(args.output)
