@@ -3027,6 +3027,18 @@ def init_cap_validation_details(entry, rank):
     details["best_cap_bbox_area"] = 0
     details["best_cap_center"] = None
     details["best_cap_total_arc"] = 0.0
+    details["sweep_gate_enabled"] = False
+    details["best_sweep_valid"] = False
+    details["best_sweep_iou"] = 0.0
+    details["best_sweep_intersection"] = 0
+    details["best_sweep_union"] = 0
+    details["best_sweep_area"] = 0
+    details["best_sweep_copy_side_stroke"] = None
+    details["best_sweep_copy_reason"] = ""
+    details["best_sweep_mask_source"] = ""
+    details["best_sweep_passed"] = False
+    details["cap_found_but_sweep_rejected"] = False
+    details["selection_passed"] = False
     details["invalid_no_cap"] = False
     details["selected_by_cap_validation"] = False
     details["skip_percluster_output"] = False
@@ -3062,6 +3074,24 @@ def fill_best_cap_details(details, best_cap, candidate_count):
     details["best_cap_bbox_area"] = int(best_cap.get("bbox_area", 0))
     details["best_cap_center"] = center_tuple
     details["best_cap_total_arc"] = float(best_cap.get("total_arc", 0.0))
+
+
+def fill_best_cap_sweep_details(details, sweep_info, *, gate_enabled=False, stop_thresh=0.0):
+    """Store cap-sweep similarity metadata for one entry."""
+    details["sweep_gate_enabled"] = bool(gate_enabled)
+    if not sweep_info:
+        return
+
+    details["best_sweep_valid"] = bool(sweep_info.get("valid", False))
+    details["best_sweep_iou"] = float(sweep_info.get("iou", 0.0))
+    details["best_sweep_intersection"] = int(sweep_info.get("intersection", 0))
+    details["best_sweep_union"] = int(sweep_info.get("union", 0))
+    details["best_sweep_area"] = int(sweep_info.get("sweep_area", 0))
+    details["best_sweep_copy_side_stroke"] = sweep_info.get("copy_side_stroke", None)
+    details["best_sweep_copy_reason"] = str(sweep_info.get("copy_reason", ""))
+    details["best_sweep_mask_source"] = str(sweep_info.get("mask_source", ""))
+    passed = bool(sweep_info.get("valid", False)) and float(sweep_info.get("iou", 0.0)) >= float(stop_thresh)
+    details["best_sweep_passed"] = bool(passed)
 
 
 def make_removed_subgroup_entry(parent_entry, removed_strokes, subgroup_strokes, cluster_id):
@@ -3138,25 +3168,33 @@ def validate_side_clusters_by_cap_candidates(
     max_loop_subset_size=14,
     max_subgroup_removals=-1,
     cap_pool_infos=None,
+    input_enclosed_mask=None,
+    sweep_iou_stop_thresh=0.0,
+    copy_direction_angle_tol=None,
+    copy_iou_compare_percent=None,
 ):
     """
     Compute cap candidates for every direction group.
 
-    For each direction group:
-      - use the whole group as side strokes and compute its best cap;
-      - after all full groups are checked, groups with no cap are expanded into
-        remove-one-stroke subgroups and checked;
-      - groups still without cap are expanded into deeper remove-k-stroke
-        subgroups until a valid cap is found or only one stroke remains.
+    Search is executed round by round.
 
-    All original groups and generated subgroups remain in cluster_debug so the
-    normal side/cap debug images can be written for each case.
+    Round 0 evaluates all full direction groups.
+    Round k evaluates all remove-k subgroups for every still-unresolved parent.
+
+    A round stops the search only when at least one entry produces a legal cap
+    and, when enabled, its cap-sweep occupancy IoU against the input enclosed
+    mask passes the configured threshold.  Otherwise the whole round is treated
+    as unresolved and the search continues to the next removal depth.
     """
     if model is None:
         return None, []
 
     pool_infos = infos if cap_pool_infos is None else cap_pool_infos
     cluster_debug = model.get("cluster_debug", None)
+    valid_input_enclosed_mask = None
+    if input_enclosed_mask is not None and np.count_nonzero(input_enclosed_mask > 0) > 0:
+        valid_input_enclosed_mask = (input_enclosed_mask > 0).astype(np.uint8) * 255
+    sweep_gate_enabled = bool(valid_input_enclosed_mask is not None and float(sweep_iou_stop_thresh or 0.0) > 0.0)
 
     if not cluster_debug:
         candidates = extract_cap_loop_candidates_from_strokes(
@@ -3172,21 +3210,50 @@ def validate_side_clusters_by_cap_candidates(
             max_loop_subset_size=max_loop_subset_size,
         )
         best_cap = largest_area_cap_candidate(candidates)
-        model["cap_validated"] = best_cap is not None
-        return model, ([] if best_cap is None else [best_cap])
+        sweep_info = None
+        selection_passed = best_cap is not None
+        if best_cap is not None and valid_input_enclosed_mask is not None:
+            pseudo_entry = {
+                "strokes": list(model.get("inliers", [])),
+                "indices": [int(s["index"]) for s in model.get("inliers", [])],
+                "direction": model.get("direction", None),
+            }
+            sweep_info = compute_cap_sweep_similarity(
+                image_shape,
+                pseudo_entry,
+                best_cap,
+                infos,
+                endpoint_tol,
+                thickness,
+                sketch_mask=valid_input_enclosed_mask,
+                copy_direction_angle_tol=copy_direction_angle_tol,
+                iou_compare_percent=copy_iou_compare_percent,
+            )
+            if sweep_gate_enabled:
+                selection_passed = bool(sweep_info.get("valid", False)) and float(sweep_info.get("iou", 0.0)) >= float(sweep_iou_stop_thresh)
+
+        model["cap_sweep_gate_enabled"] = bool(sweep_gate_enabled)
+        model["cap_validated"] = bool(selection_passed)
+        model["cap_validation_failed"] = not bool(selection_passed)
+        if sweep_info is not None:
+            model["best_sweep_iou"] = float(sweep_info.get("iou", 0.0))
+            model["best_sweep_valid"] = bool(sweep_info.get("valid", False))
+        return model, ([] if not selection_passed else [best_cap])
 
     original_cluster_debug = list(cluster_debug)
     expanded_cluster_debug = []
     next_cluster_id = max([int(e.get("cluster_id", -1)) for e in original_cluster_debug] + [-1]) + 1
-    selected_entry = None
-    selected_candidates = []
     successful_cap_clusters = []
     cap_search_trace = []
+    cap_search_rounds = []
+    selected_result = None
 
     def evaluate_entry(entry, rank):
         details = init_cap_validation_details(entry, rank)
+        details["sweep_gate_enabled"] = bool(sweep_gate_enabled)
         n_strokes = int(details.get("n", len(entry.get("strokes", []))))
         best_cap = None
+        sweep_info = None
         if n_strokes < 2:
             details["cap_validation_skipped"] = True
             details["cap_validation_skip_reason"] = "n_lt_2"
@@ -3208,8 +3275,36 @@ def validate_side_clusters_by_cap_candidates(
                 cap_pool_infos=pool_infos,
             )
             fill_best_cap_details(details, best_cap, len(trial_candidates))
+            if best_cap is not None and valid_input_enclosed_mask is not None:
+                sweep_info = compute_cap_sweep_similarity(
+                    image_shape,
+                    entry,
+                    best_cap,
+                    infos,
+                    endpoint_tol,
+                    thickness,
+                    sketch_mask=valid_input_enclosed_mask,
+                    copy_direction_angle_tol=copy_direction_angle_tol,
+                    iou_compare_percent=copy_iou_compare_percent,
+                )
+                fill_best_cap_sweep_details(
+                    details,
+                    sweep_info,
+                    gate_enabled=sweep_gate_enabled,
+                    stop_thresh=sweep_iou_stop_thresh,
+                )
 
-        cap_search_trace.append({
+        selection_passed = False
+        if best_cap is not None:
+            if sweep_gate_enabled:
+                selection_passed = bool(details.get("best_sweep_passed", False))
+                details["cap_found_but_sweep_rejected"] = not bool(selection_passed)
+            else:
+                selection_passed = True
+        details["selection_passed"] = bool(selection_passed)
+        details["cap_validation_selectable"] = bool(selection_passed)
+
+        trace_item = {
             "order": int(len(cap_search_trace)),
             "rank": int(rank),
             "cluster_id": int(entry.get("cluster_id", -1)),
@@ -3230,46 +3325,110 @@ def validate_side_clusters_by_cap_candidates(
             "best_cap_total_arc": float(details.get("best_cap_total_arc", 0.0)),
             "best_cap_score": float(details.get("best_cap_score", 0.0)),
             "best_cap_strokes": list(details.get("best_cap_strokes", [])),
-        })
-        return best_cap
-
-    def record_success(entry, rank, best_cap, parent_cluster_id=None, removed_stroke_indices=None):
-        nonlocal selected_entry, selected_candidates
-        side_set = cluster_entry_index_set(entry)
-        removed_stroke_indices = [] if removed_stroke_indices is None else list(removed_stroke_indices)
-        successful_cap_clusters.append({
+            "best_sweep_valid": bool(details.get("best_sweep_valid", False)),
+            "best_sweep_iou": float(details.get("best_sweep_iou", 0.0)),
+            "best_sweep_intersection": int(details.get("best_sweep_intersection", 0)),
+            "best_sweep_union": int(details.get("best_sweep_union", 0)),
+            "best_sweep_area": int(details.get("best_sweep_area", 0)),
+            "best_sweep_copy_side_stroke": details.get("best_sweep_copy_side_stroke", None),
+            "best_sweep_copy_reason": details.get("best_sweep_copy_reason", ""),
+            "cap_found_but_sweep_rejected": bool(details.get("cap_found_but_sweep_rejected", False)),
+            "selection_passed": bool(selection_passed),
+        }
+        cap_search_trace.append(trace_item)
+        return {
+            "entry": entry,
             "rank": int(rank),
-            "cluster_id": int(entry.get("cluster_id", -1)),
-            "side_set": set(side_set),
-            "parent_cluster_id": parent_cluster_id,
-            "removed_stroke_index": removed_stroke_indices[0] if len(removed_stroke_indices) == 1 else None,
-            "removed_stroke_indices": removed_stroke_indices,
-            "removal_depth": int(len(removed_stroke_indices)),
+            "best_cap": best_cap,
+            "trial_candidates": trial_candidates,
+            "selection_passed": bool(selection_passed),
+            "trace_item": trace_item,
+        }
+
+    def winner_sort_key(result):
+        cap = result.get("best_cap") or {}
+        trace_item = result.get("trace_item", {})
+        return (
+            float(trace_item.get("best_sweep_iou", 0.0)),
+            int(cap.get("area", 0)),
+            float(cap.get("score", 0.0)),
+            -int(result.get("rank", 0)),
+        )
+
+    def choose_round_winner(round_results):
+        if sweep_gate_enabled:
+            passing = [r for r in round_results if r.get("selection_passed", False)]
+            if not passing:
+                return None
+            return max(passing, key=winner_sort_key)
+        for result in round_results:
+            if result.get("selection_passed", False):
+                return result
+        return None
+
+    def record_successful_results(round_results):
+        for result in round_results:
+            if not result.get("selection_passed", False):
+                continue
+            entry = result["entry"]
+            removed_stroke_indices = list(entry.get("removed_stroke_indices", []))
+            side_set = cluster_entry_index_set(entry)
+            successful_cap_clusters.append({
+                "rank": int(result.get("rank", -1)),
+                "cluster_id": int(entry.get("cluster_id", -1)),
+                "side_set": set(side_set),
+                "parent_cluster_id": entry.get("parent_cluster_id", None),
+                "removed_stroke_index": removed_stroke_indices[0] if len(removed_stroke_indices) == 1 else None,
+                "removed_stroke_indices": removed_stroke_indices,
+                "removal_depth": int(entry.get("removal_depth", 0)),
+            })
+
+    def summarize_round(removal_depth, round_results, winner):
+        cap_results = [r for r in round_results if r.get("best_cap") is not None]
+        best_iou_result = None
+        valid_iou_results = [r for r in cap_results if r.get("trace_item", {}).get("best_sweep_valid", False)]
+        if valid_iou_results:
+            best_iou_result = max(valid_iou_results, key=winner_sort_key)
+        cap_search_rounds.append({
+            "removal_depth": int(removal_depth),
+            "entry_count": int(len(round_results)),
+            "cap_count": int(len(cap_results)),
+            "passed_count": int(sum(1 for r in round_results if r.get("selection_passed", False))),
+            "best_iou_cluster_id": None if best_iou_result is None else int(best_iou_result["entry"].get("cluster_id", -1)),
+            "best_iou": 0.0 if best_iou_result is None else float(best_iou_result.get("trace_item", {}).get("best_sweep_iou", 0.0)),
+            "winner_cluster_id": None if winner is None else int(winner["entry"].get("cluster_id", -1)),
+            "stopped": bool(winner is not None),
         })
 
-        if selected_entry is None:
-            selected_entry = entry
-            selected_candidates = [best_cap]
-            entry["details"]["selected_by_cap_validation"] = True
+    def parent_unresolved_after_round(parent_entry, parent_round_results, removal_depth):
+        remaining_after_removal = len(parent_entry.get("strokes", [])) - int(removal_depth)
+        if remaining_after_removal <= 1:
+            return False
+        if sweep_gate_enabled:
+            return not any(r.get("selection_passed", False) for r in parent_round_results)
+        return not any(r.get("best_cap") is not None for r in parent_round_results)
 
-    failed_original_groups = []
-
-    # Level 0: check every full direction group first.
+    original_round_results = []
     for entry in original_cluster_debug:
         rank = len(expanded_cluster_debug)
         expanded_cluster_debug.append(entry)
-        best_cap = evaluate_entry(entry, rank)
+        original_round_results.append(evaluate_entry(entry, rank))
 
-        if best_cap is None:
-            strokes = list(entry.get("strokes", []))
-            if len(strokes) > 1:
+    record_successful_results(original_round_results)
+    selected_result = choose_round_winner(original_round_results)
+    summarize_round(0, original_round_results, selected_result)
+
+    failed_original_groups = []
+    if selected_result is None:
+        for result in original_round_results:
+            entry = result["entry"]
+            if len(entry.get("strokes", [])) <= 1:
+                continue
+            if sweep_gate_enabled:
                 failed_original_groups.append(entry)
-            continue
+            elif result.get("best_cap") is None:
+                failed_original_groups.append(entry)
 
-        record_success(entry, rank, best_cap)
-
-    # Levels 1..N: for original groups that still have no cap, check all
-    # remove-k subgroups before moving to remove-(k+1).
     import itertools
 
     max_possible_removals = 0
@@ -3281,16 +3440,17 @@ def validate_side_clusters_by_cap_candidates(
         max_subgroup_removals = min(max_possible_removals, max(0, int(max_subgroup_removals)))
 
     for removal_depth in range(1, max_subgroup_removals + 1):
-        if not failed_original_groups:
+        if selected_result is not None or not failed_original_groups:
             break
 
+        round_results = []
         still_failed = []
         for parent_entry in failed_original_groups:
             parent_strokes = list(parent_entry.get("strokes", []))
             if len(parent_strokes) - removal_depth < 1:
                 continue
 
-            found_for_parent = False
+            parent_round_results = []
             for removed_positions in itertools.combinations(range(len(parent_strokes)), removal_depth):
                 removed_positions = set(removed_positions)
                 removed_strokes = [s for i, s in enumerate(parent_strokes) if i in removed_positions]
@@ -3306,27 +3466,25 @@ def validate_side_clusters_by_cap_candidates(
 
                 subgroup_rank = len(expanded_cluster_debug)
                 expanded_cluster_debug.append(subgroup)
-                subgroup_cap = evaluate_entry(subgroup, subgroup_rank)
-                if subgroup_cap is None:
-                    continue
+                subgroup_result = evaluate_entry(subgroup, subgroup_rank)
+                round_results.append(subgroup_result)
+                parent_round_results.append(subgroup_result)
 
-                found_for_parent = True
-                record_success(
-                    subgroup,
-                    subgroup_rank,
-                    subgroup_cap,
-                    parent_cluster_id=int(parent_entry.get("cluster_id", -1)),
-                    removed_stroke_indices=[int(s["index"]) for s in removed_strokes],
-                )
-                break
-
-            if not found_for_parent:
+            if parent_unresolved_after_round(parent_entry, parent_round_results, removal_depth):
                 still_failed.append(parent_entry)
+
+        record_successful_results(round_results)
+        selected_result = choose_round_winner(round_results)
+        summarize_round(removal_depth, round_results, selected_result)
+        if selected_result is not None:
+            break
 
         failed_original_groups = still_failed
 
     model["cluster_debug"] = expanded_cluster_debug
     model["cap_search_trace"] = cap_search_trace
+    model["cap_search_rounds"] = cap_search_rounds
+    model["cap_sweep_gate_enabled"] = bool(sweep_gate_enabled)
     model["successful_cap_clusters"] = [
         {
             "rank": int(x["rank"]),
@@ -3340,12 +3498,21 @@ def validate_side_clusters_by_cap_candidates(
         for x in successful_cap_clusters
     ]
 
-    if selected_entry is None:
+    if selected_result is None:
         model["cap_validated"] = False
         model["cap_validation_failed"] = True
-        model["cap_validation_message"] = "No ranked side cluster produced a legal closed-loop cap candidate."
+        if sweep_gate_enabled:
+            model["cap_validation_message"] = (
+                "No search round produced a cap whose swept extrusion occupancy IoU passed the input enclosed-mask threshold."
+            )
+        else:
+            model["cap_validation_message"] = "No ranked side cluster produced a legal closed-loop cap candidate."
         model["cap_search_trace"] = cap_search_trace
         return model, []
+
+    selected_entry = selected_result["entry"]
+    selected_entry["details"]["selected_by_cap_validation"] = True
+    selected_candidates = [selected_result["best_cap"]]
 
     validated_model = make_trial_model_from_cluster_entry(
         model,
@@ -3354,12 +3521,21 @@ def validate_side_clusters_by_cap_candidates(
         cap_validated=True,
     )
     validated_model["cap_validation_failed"] = False
-    validated_model["cap_validation_message"] = (
-        "Computed best cap for every full direction group first.  For groups with no legal cap, "
-        "computed remove-k-stroke subgroups level by level and selected the first entry that produced a legal cap."
-    )
+    if sweep_gate_enabled:
+        validated_model["cap_validation_message"] = (
+            "Computed every subgroup in each removal-depth round and stopped only when a round produced at least one cap "
+            "whose swept extrusion occupancy IoU passed the input enclosed-mask threshold. The selected entry is the highest-IoU "
+            "candidate from that stopping round."
+        )
+    else:
+        validated_model["cap_validation_message"] = (
+            "Computed best cap for every full direction group first. If none had a legal cap, computed every remove-k subgroup "
+            "round by round until one entry produced a legal cap."
+        )
     validated_model["successful_cap_clusters"] = model.get("successful_cap_clusters", [])
     validated_model["cap_search_trace"] = cap_search_trace
+    validated_model["cap_search_rounds"] = cap_search_rounds
+    validated_model["cap_sweep_gate_enabled"] = bool(sweep_gate_enabled)
     return validated_model, selected_candidates
 
 # ============================================================
@@ -4718,8 +4894,10 @@ def format_cluster_debug_entry(entry, selected_cluster_id=None):
             f"best_cap_area={details.get('best_cap_area', 0)}, "
             f"best_cap_enclosed={details.get('best_cap_enclosed_area', 0)}, "
             f"best_cap_bbox_area={details.get('best_cap_bbox_area', 0)}, "
+            f"best_sweep_iou={details.get('best_sweep_iou', 0.0):.4f}, "
             f"best_cap_strokes={details.get('best_cap_strokes', [])}, "
         f"invalid_no_cap={details.get('invalid_no_cap', False)}, "
+        f"selection_passed={details.get('selection_passed', False)}, "
         f"cap_selected={details.get('selected_by_cap_validation', False)}, "
         f"spread_penalty={details.get('spread_penalty', 0.0):.1f}"
     )
@@ -4765,6 +4943,9 @@ def write_cluster_debug_report(path, model):
                 f"best_area={details.get('best_cap_area', 0)}, "
                 f"best_enclosed_area={details.get('best_cap_enclosed_area', 0)}, "
                 f"best_bbox_area={details.get('best_cap_bbox_area', 0)}, "
+                f"best_sweep_iou={details.get('best_sweep_iou', 0.0):.4f}, "
+                f"best_sweep_valid={details.get('best_sweep_valid', False)}, "
+                f"best_sweep_passed={details.get('best_sweep_passed', False)}, "
                 f"best_strokes={details.get('best_cap_strokes', [])}, "
                 f"best_score={details.get('best_cap_score', 0.0):.1f}, "
                 f"best_center={details.get('best_cap_center', None)}, "
@@ -4794,8 +4975,8 @@ def write_cap_search_trace_report(path, model):
     with open(path, "w", encoding="utf-8") as f:
         f.write("==== Cap Search Trace ====\n\n")
         f.write("Order is the actual execution order.\n")
-        f.write("Full direction groups are checked first.  Failed groups are then expanded level by level: remove-1, remove-2, ... until success or one stroke remains.\n")
-        f.write("A direction group stops expanding as soon as its full group or one subgroup finds a valid cap.\n\n")
+        f.write("Full direction groups are checked first. Failed groups are then expanded level by level: remove-1, remove-2, ... until success or one stroke remains.\n")
+        f.write("Every subgroup in the same removal-depth round is evaluated before deciding whether that round can stop the search.\n\n")
 
         if not trace:
             f.write("No cap search trace recorded.\n")
@@ -4820,9 +5001,35 @@ def write_cap_search_trace_report(path, model):
                 f"best_area={int(item.get('best_cap_area', 0))}, "
                 f"best_enclosed_area={int(item.get('best_cap_enclosed_area', 0))}, "
                 f"best_bbox_area={int(item.get('best_cap_bbox_area', 0))}, "
+                f"best_sweep_iou={float(item.get('best_sweep_iou', 0.0)):.4f}, "
+                f"best_sweep_valid={item.get('best_sweep_valid', False)}, "
+                f"selection_passed={item.get('selection_passed', False)}, "
                 f"best_total_arc={float(item.get('best_cap_total_arc', 0.0)):.1f}, "
                 f"best_score={float(item.get('best_cap_score', 0.0)):.1f}, "
                 f"best_cap_strokes={item.get('best_cap_strokes', [])}\n"
+            )
+
+
+def write_cap_search_round_report(path, model):
+    """Write one line per removal-depth round for sweep-gated cap search."""
+    rounds = model.get("cap_search_rounds", []) if model is not None else []
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("==== Cap Search Rounds ====\n\n")
+        if model is not None:
+            f.write(f"sweep_gate_enabled: {bool(model.get('cap_sweep_gate_enabled', False))}\n")
+        if not rounds:
+            f.write("No round summary recorded.\n")
+            return
+        for item in rounds:
+            f.write(
+                f"round depth={int(item.get('removal_depth', 0))}: "
+                f"entries={int(item.get('entry_count', 0))}, "
+                f"cap_count={int(item.get('cap_count', 0))}, "
+                f"passed_count={int(item.get('passed_count', 0))}, "
+                f"best_iou_cluster={item.get('best_iou_cluster_id', None)}, "
+                f"best_iou={float(item.get('best_iou', 0.0)):.4f}, "
+                f"winner_cluster={item.get('winner_cluster_id', None)}, "
+                f"stopped={bool(item.get('stopped', False))}\n"
             )
 
 
@@ -4911,6 +5118,7 @@ def save_cluster_debug_outputs(debug_dir, img_shape, model):
 
     write_cluster_debug_report(os.path.join(debug_dir, "05b_direction_cluster_scores.txt"), model)
     write_cap_search_trace_report(os.path.join(debug_dir, "05d_cap_search_trace.txt"), model)
+    write_cap_search_round_report(os.path.join(debug_dir, "05e_cap_search_rounds.txt"), model)
     overview = draw_cluster_overview_image(img_shape, model)
     cv2.imwrite(os.path.join(debug_dir, "05b_direction_cluster_scores.png"), overview)
 
@@ -5639,12 +5847,12 @@ def save_cap_endpoint_graph_debug_outputs(debug_dir, img_shape, model, infos, ar
 
 
 def successful_direction_parent_ids(model):
-    """Return original direction group ids that eventually found a valid cap."""
+    """Return original direction group ids that eventually produced a selectable result."""
     ids = set()
     if model is None:
         return ids
     for item in model.get("cap_search_trace", []):
-        if not item.get("cap_found", False):
+        if not item.get("selection_passed", item.get("cap_found", False)):
             continue
         parent_id = item.get("parent_cluster_id", None)
         if parent_id is None:
@@ -6054,6 +6262,69 @@ def save_bbox_masks_geometric(
     return masks
 
 
+def compute_cap_sweep_similarity(
+    shape,
+    entry,
+    cap_candidate,
+    infos,
+    endpoint_tol,
+    cap_loop_thickness,
+    sketch_mask=None,
+    copy_direction_angle_tol=None,
+    iou_compare_percent=None,
+):
+    """Compute cap-sweep occupancy IoU against the input enclosed mask."""
+    result = {
+        "valid": False,
+        "iou": 0.0,
+        "intersection": 0,
+        "union": 0,
+        "sweep_area": 0,
+        "copy_side_stroke": None,
+        "copy_reason": "",
+        "mask_source": "",
+        "geometry": None,
+    }
+    if cap_candidate is None or sketch_mask is None or np.count_nonzero(sketch_mask > 0) == 0:
+        return result
+
+    masks = build_bbox_masks_geometric(
+        shape,
+        entry,
+        cap_candidate,
+        infos,
+        endpoint_tol,
+        cap_loop_thickness,
+        debug_dir=None,
+        copy_direction_angle_tol=copy_direction_angle_tol,
+        sketch_mask=sketch_mask,
+        iou_compare_percent=iou_compare_percent,
+    )
+    if masks is None:
+        return result
+
+    occupied = masks.get("occupied", None)
+    if occupied is None or np.count_nonzero(occupied > 0) == 0:
+        return result
+
+    iou, intersection, union = binary_mask_iou(occupied, sketch_mask)
+    geometry = masks.get("geometry", None) or {}
+    result.update({
+        "valid": True,
+        "iou": float(iou),
+        "intersection": int(intersection),
+        "union": int(union),
+        "sweep_area": int(binary_mask_area(occupied)),
+        "copy_side_stroke": (
+            None if geometry.get("selected_stroke", None) is None else int(geometry.get("selected_stroke", -1))
+        ),
+        "copy_reason": str(geometry.get("copy_selection_reason", "")),
+        "mask_source": str(masks.get("mask_source", "")),
+        "geometry": geometry,
+    })
+    return result
+
+
 def draw_cap_sweep_visualization(bbox_masks):
     """Same legend as draw_bbox_from_bestcap_overlay but driven by geometric masks."""
     green_cap = bbox_masks["source_cap"]
@@ -6258,7 +6529,7 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
         f.write("Every direction group is tried as side strokes.\n")
         f.write("When a direction group has no valid cap, remove-k-stroke subgroups are tried level by level until success or one stroke remains.\n")
         f.write("Clusters with n<2 are recorded but do not compute cap.\n")
-        f.write("Only direction-group search paths that eventually found a valid cap are emitted here.\n")
+        f.write("Only direction-group search paths that eventually produced a selectable stopping-round result are emitted here.\n")
         f.write("Each emitted cluster stores only the largest-area cap candidate.\n\n")
 
         for rank, entry in enumerate(cluster_debug):
@@ -6311,6 +6582,10 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
 
             bbox_masks = None
             bbox_img = None
+            sweep_iou = 0.0
+            sweep_intersection = 0
+            sweep_union = 0
+            sweep_area = 0
             if cap_candidate is not None:
                 bbox_masks = save_bbox_masks_geometric(
                     out_dir,
@@ -6357,15 +6632,15 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
                 cv2.imwrite(os.path.join(out_dir, base + "_cap_sweep.png"), bbox_img)
                 if sketch_area > 0 and sketch_mask is not None:
                     sweep_area = binary_mask_area(bbox_masks["occupied"])
-                    iou, intersection, union = binary_mask_iou(bbox_masks["occupied"], sketch_mask)
+                    sweep_iou, sweep_intersection, sweep_union = binary_mask_iou(bbox_masks["occupied"], sketch_mask)
                     iou_rank_records.append({
                         "base": base,
                         "overlay_img": overlay_img.copy(),
                         "sweep_area": sweep_area,
                         "sketch_area": sketch_area,
-                        "iou": iou,
-                        "intersection": intersection,
-                        "union": union,
+                        "iou": sweep_iou,
+                        "intersection": sweep_intersection,
+                        "union": sweep_union,
                         "copy_side_stroke": (
                             int(bbox_masks.get("geometry", {}).get("selected_stroke", -1))
                             if bbox_masks is not None
@@ -6405,6 +6680,7 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
                     f"side={entry.get('indices', [])} best_cap_strokes={cap_candidate.get('stroke_indices', [])} "
                     f"best_cap_area={cap_candidate.get('area', 0)} best_cap_enclosed_area={cap_candidate.get('enclosed_area', 0)} "
                     f"best_cap_bbox_area={cap_candidate.get('bbox_area', 0)} best_cap_bbox={cap_candidate.get('bbox', None)} "
+                    f"best_sweep_iou={float(sweep_iou):.6f} best_sweep_intersection={int(sweep_intersection)} best_sweep_union={int(sweep_union)} best_sweep_area={int(sweep_area)} "
                     f"best_cap_total_arc={cap_candidate.get('total_arc', 0.0):.1f} "
                     f"best_cap_score={cap_candidate.get('score', 0.0):.1f} "
                     f"removed_post_loop_self_strokes={cap_candidate.get('removed_post_loop_self_strokes', [])} "
@@ -6893,17 +7169,22 @@ def save_preprocess_debug_outputs(debug_dir, img, bw, skel):
     cv2.imwrite(os.path.join(debug_dir, "02b_skeleton_nodes.png"), draw_skeleton_nodes_debug(skel))
 
 
-def save_input_enclosed_mask_debug_outputs(debug_dir, bw, infos, endpoint_tol=50.0):
-    """Save input enclosed mask using split/post-merge stroke endpoints."""
-    if debug_dir is None:
-        return
-    ensure_dir(debug_dir)
+def compute_input_enclosed_mask_debug_data(bw, infos, endpoint_tol=50.0):
+    """Return the input enclosed mask and debug metadata used by sweep IoU checks."""
     enclosed_mask, closed_strokes, close_info = make_input_enclosed_region_mask(
         bw,
         stroke_infos=infos,
         endpoint_tol=endpoint_tol,
         return_debug=True,
     )
+    return enclosed_mask, closed_strokes, close_info
+
+
+def save_input_enclosed_mask_debug_outputs(debug_dir, enclosed_mask, closed_strokes, close_info):
+    """Save precomputed input enclosed mask debug outputs."""
+    if debug_dir is None:
+        return
+    ensure_dir(debug_dir)
     cv2.imwrite(os.path.join(debug_dir, "00b_input_closed_strokes.png"), closed_strokes)
     cv2.imwrite(os.path.join(debug_dir, "00c_input_enclosed_mask.png"), enclosed_mask)
     with open(os.path.join(debug_dir, "00c_input_enclosed_mask_info.txt"), "w", encoding="utf-8") as f:
@@ -7241,6 +7522,8 @@ def main():
                         help="Reject cap candidates whose cap bbox area is smaller than this value. The bbox is computed on loop pixels union enclosed cap pixels.")
     parser.add_argument("--min-cap-total-arc", type=float, default=0.0,
                         help="Reject cap candidates whose total stroke arc length is smaller than this value.")
+    parser.add_argument("--cap-sweep-iou-stop-thresh", type=float, default=0.0,
+                        help="Only stop cap search when a removal-depth round contains at least one cap whose swept extrusion occupancy IoU against the input enclosed mask is >= this threshold. 0 keeps the old cap-only stopping behavior.")
     parser.add_argument("--cap-loop-endpoint-tol", type=float, default=12.0,
                         help="Endpoint tolerance for deciding whether remaining strokes form a closed cap loop.")
     parser.add_argument("--cap-loop-thickness", type=int, default=2,
@@ -7337,7 +7620,17 @@ def main():
     save_merged_strokes_debug_outputs(args.debug_dir, img.shape, merged_strokes)
 
     infos = build_stroke_infos(merged_strokes)
-    save_input_enclosed_mask_debug_outputs(args.debug_dir, bw, infos, endpoint_tol=args.cap_loop_endpoint_tol)
+    input_enclosed_mask, input_closed_strokes, input_enclosed_info = compute_input_enclosed_mask_debug_data(
+        bw,
+        infos,
+        endpoint_tol=args.cap_loop_endpoint_tol,
+    )
+    save_input_enclosed_mask_debug_outputs(
+        args.debug_dir,
+        input_enclosed_mask,
+        input_closed_strokes,
+        input_enclosed_info,
+    )
     step_line_strokes = [
         s for s in infos
         if s["arc"] >= args.min_stroke_length and s["straightness"] >= args.straightness
@@ -7372,6 +7665,10 @@ def main():
         max_loop_subset_size=args.cap_loop_max_subset_size,
         max_subgroup_removals=args.cap_subgroup_max_removals,
         cap_pool_infos=cap_pool_infos,
+        input_enclosed_mask=input_enclosed_mask,
+        sweep_iou_stop_thresh=args.cap_sweep_iou_stop_thresh,
+        copy_direction_angle_tol=args.parallel_angle_thresh,
+        copy_iou_compare_percent=args.copy_side_iou_compare_percent,
     )
     save_model_debug_outputs(args.debug_dir, img.shape, model, infos, args)
 
@@ -7385,6 +7682,11 @@ def main():
     )
 
     if model.get("cap_validation_failed", False):
+        if float(args.cap_sweep_iou_stop_thresh or 0.0) > 0.0:
+            raise RuntimeError(
+                "No side cluster produced a cap sweep whose extrusion occupancy IoU passed --cap-sweep-iou-stop-thresh. "
+                "Debug outputs were saved; check 05d_cap_search_trace.txt and 05e_cap_search_rounds.txt for details."
+            )
         raise RuntimeError(
             "No side cluster produced a legal closed-loop cap candidate. "
             "Debug outputs were saved; check 05b_direction_cluster_scores.txt for cap_validation details."

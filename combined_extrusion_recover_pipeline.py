@@ -75,6 +75,12 @@ def main():
         default=0,
         help="Forwarded to the extrusion script. Reject cap candidates whose bbox area is below this threshold.",
     )
+    parser.add_argument(
+        "--cap-sweep-iou-stop-thresh",
+        type=float,
+        default=0.0,
+        help="Forwarded to the extrusion script. Only stop cap search when a removal-depth round contains a cap sweep whose IoU against the input enclosed mask reaches this threshold.",
+    )
     parser.add_argument("--min-cap-total-arc", type=float, default=50)
     parser.add_argument("--split-segment-arc", type=float, default=30)
     parser.add_argument("--split-peak-min-distance", type=float, default=10)
@@ -211,6 +217,8 @@ def main():
             str(args.same_loop_endpoint_tol),
             "--min-cap-bbox-area",
             str(args.min_cap_bbox_area),
+            "--cap-sweep-iou-stop-thresh",
+            str(args.cap_sweep_iou_stop_thresh),
             "--min-cap-total-arc",
             str(args.min_cap_total_arc),
             "--split-segment-arc",
