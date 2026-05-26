@@ -163,6 +163,30 @@ def main():
         help="Pass the curved-stroke 2D resample step to recover_rank_cap_endpoints_3d.py.",
     )
     parser.add_argument(
+        "--curve-min-chord-px",
+        type=float,
+        default=30.0,
+        help="Pass the minimum chord length for 3D curved-stroke recovery.",
+    )
+    parser.add_argument(
+        "--curve-min-p90-chord-dev-px",
+        type=float,
+        default=5.0,
+        help="Pass the minimum p90 endpoint-chord deviation for 3D curved-stroke recovery.",
+    )
+    parser.add_argument(
+        "--curve-min-dev-ratio",
+        type=float,
+        default=0.04,
+        help="Pass the minimum p90 deviation/chord ratio for 3D curved-stroke recovery.",
+    )
+    parser.add_argument(
+        "--curve-min-pca-rms-px",
+        type=float,
+        default=2.0,
+        help="Pass the minimum PCA fitted-line RMS error for 3D curved-stroke recovery.",
+    )
+    parser.add_argument(
         "--blender-cap-debug-png",
         default="debug/blender_reconstruction_cap_2d.png",
         help="Pass the Blender-cap 2D PNG debug output path to recover_rank_cap_endpoints_3d.py.",
@@ -261,6 +285,14 @@ def main():
             str(args.curve_straightness_thresh),
             "--curve-resample-step-px",
             str(args.curve_resample_step_px),
+            "--curve-min-chord-px",
+            str(args.curve_min_chord_px),
+            "--curve-min-p90-chord-dev-px",
+            str(args.curve_min_p90_chord_dev_px),
+            "--curve-min-dev-ratio",
+            str(args.curve_min_dev_ratio),
+            "--curve-min-pca-rms-px",
+            str(args.curve_min_pca_rms_px),
             "--blender-cap-debug-png",
             str(resolve_path(args.blender_cap_debug_png)),
             "--blender-cap-debug-json",

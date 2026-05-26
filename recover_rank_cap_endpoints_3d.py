@@ -183,7 +183,19 @@ def snap_nearby_endpoint_pairs(endpoint_members, tol):
     return groups
 
 
-def load_cap_endpoint_graph_groups(path, cluster_id, cap_ids, tol, strokes=None, straightness_threshold=0.9, resample_step=15.0):
+def load_cap_endpoint_graph_groups(
+    path,
+    cluster_id,
+    cap_ids,
+    tol,
+    strokes=None,
+    straightness_threshold=0.9,
+    resample_step=15.0,
+    curve_min_chord_px=30.0,
+    curve_min_p90_chord_dev_px=5.0,
+    curve_min_dev_ratio=0.04,
+    curve_min_pca_rms_px=2.0,
+):
     path = Path(path)
     if not path.exists():
         return None, f"{path} does not exist"
@@ -227,6 +239,10 @@ def load_cap_endpoint_graph_groups(path, cluster_id, cap_ids, tol, strokes=None,
                     strokes[sid],
                     straightness_threshold=straightness_threshold,
                     resample_step=resample_step,
+                    curve_min_chord_px=curve_min_chord_px,
+                    curve_min_p90_chord_dev_px=curve_min_p90_chord_dev_px,
+                    curve_min_dev_ratio=curve_min_dev_ratio,
+                    curve_min_pca_rms_px=curve_min_pca_rms_px,
                 )
                 pixel = polyline_2d[0] if endpoint_match.group(2) == "start" else polyline_2d[-1]
             current_component["endpoints"].append(
@@ -1299,15 +1315,123 @@ def resample_polyline_by_step(points, step=15.0):
     return np.asarray(out, dtype=float)
 
 
-def simplify_stroke_points(stroke, straightness_threshold=0.9, resample_step=15.0):
+def stroke_curve_metrics(points, straightness=None):
+    pts = np.asarray(points, dtype=float)
+    if len(pts) < 2:
+        return {
+            "point_count": int(len(pts)),
+            "arc": 0.0,
+            "chord": 0.0,
+            "straightness": 1.0 if straightness is None else float(straightness),
+            "p90_chord_deviation": 0.0,
+            "max_chord_deviation": 0.0,
+            "deviation_ratio": 0.0,
+            "pca_rms_error": 0.0,
+        }
+
+    segs = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    arc = float(np.sum(segs))
+    chord_vec = pts[-1] - pts[0]
+    chord = norm(chord_vec)
+    measured_straightness = 1.0 if arc <= 1e-9 else float(chord / arc)
+    if straightness is not None:
+        measured_straightness = float(straightness)
+
+    if chord <= 1e-9:
+        chord_devs = np.linalg.norm(pts - pts[0], axis=1)
+    else:
+        chord_dir = chord_vec / chord
+        rel = pts - pts[0]
+        signed = rel[:, 0] * chord_dir[1] - rel[:, 1] * chord_dir[0]
+        chord_devs = np.abs(signed)
+
+    center = np.mean(pts, axis=0)
+    X = pts - center
+    if len(pts) >= 2:
+        cov = X.T @ X / max(len(pts), 1)
+        vals, vecs = np.linalg.eigh(cov)
+        direction = unit(vecs[:, int(np.argmax(vals))])
+        normal = np.array([-direction[1], direction[0]], dtype=float)
+        pca_distances = X @ normal
+        pca_rms = float(np.sqrt(np.mean(pca_distances * pca_distances)))
+    else:
+        pca_rms = 0.0
+
+    p90 = float(np.percentile(chord_devs, 90)) if len(chord_devs) else 0.0
+    max_dev = float(np.max(chord_devs)) if len(chord_devs) else 0.0
+    ratio = 0.0 if chord <= 1e-9 else float(p90 / chord)
+    return {
+        "point_count": int(len(pts)),
+        "arc": float(arc),
+        "chord": float(chord),
+        "straightness": float(measured_straightness),
+        "p90_chord_deviation": p90,
+        "max_chord_deviation": max_dev,
+        "deviation_ratio": ratio,
+        "pca_rms_error": pca_rms,
+    }
+
+
+def classify_stroke_curve(
+    stroke,
+    straightness_threshold=0.9,
+    curve_min_chord_px=30.0,
+    curve_min_p90_chord_dev_px=5.0,
+    curve_min_dev_ratio=0.04,
+    curve_min_pca_rms_px=2.0,
+):
     points = np.asarray(stroke.get("points", [stroke["p0"], stroke["p1"]]), dtype=float)
-    straightness = float(stroke.get("straightness", 1.0))
-    if straightness >= float(straightness_threshold) or len(points) < 3:
-        return np.vstack([points[0], points[-1]]), False
+    metrics = stroke_curve_metrics(points, straightness=stroke.get("straightness", None))
+    metrics["straightness_threshold"] = float(straightness_threshold)
+    metrics["curve_min_chord_px"] = float(curve_min_chord_px)
+    metrics["curve_min_p90_chord_dev_px"] = float(curve_min_p90_chord_dev_px)
+    metrics["curve_min_dev_ratio"] = float(curve_min_dev_ratio)
+    metrics["curve_min_pca_rms_px"] = float(curve_min_pca_rms_px)
+
+    checks = {
+        "enough_points": len(points) >= 3,
+        "chord_ge_min": metrics["chord"] >= float(curve_min_chord_px),
+        "straightness_below_threshold": metrics["straightness"] < float(straightness_threshold),
+        "p90_dev_ge_min": metrics["p90_chord_deviation"] >= float(curve_min_p90_chord_dev_px),
+        "dev_ratio_ge_min": metrics["deviation_ratio"] >= float(curve_min_dev_ratio),
+        "pca_rms_ge_min": metrics["pca_rms_error"] >= float(curve_min_pca_rms_px),
+    }
+    is_curve = all(checks.values())
+    metrics["checks"] = checks
+    metrics["decision"] = "curve_global_bend" if is_curve else "straight_or_hand_jitter"
+    return bool(is_curve), metrics
+
+
+def simplify_stroke_points(
+    stroke,
+    straightness_threshold=0.9,
+    resample_step=15.0,
+    curve_min_chord_px=30.0,
+    curve_min_p90_chord_dev_px=5.0,
+    curve_min_dev_ratio=0.04,
+    curve_min_pca_rms_px=2.0,
+    return_metrics=False,
+):
+    points = np.asarray(stroke.get("points", [stroke["p0"], stroke["p1"]]), dtype=float)
+    is_curve, metrics = classify_stroke_curve(
+        stroke,
+        straightness_threshold=straightness_threshold,
+        curve_min_chord_px=curve_min_chord_px,
+        curve_min_p90_chord_dev_px=curve_min_p90_chord_dev_px,
+        curve_min_dev_ratio=curve_min_dev_ratio,
+        curve_min_pca_rms_px=curve_min_pca_rms_px,
+    )
+    if len(points) < 2:
+        line = np.vstack([stroke["p0"], stroke["p1"]])
+        return (line, False, metrics) if return_metrics else (line, False)
+    if not is_curve:
+        line = np.vstack([points[0], points[-1]])
+        return (line, False, metrics) if return_metrics else (line, False)
 
     resampled = resample_polyline_by_step(points, step=resample_step)
     if len(resampled) < 2:
-        return np.vstack([points[0], points[-1]]), False
+        line = np.vstack([points[0], points[-1]])
+        return (line, False, metrics) if return_metrics else (line, False)
 
     center = np.mean(resampled, axis=0)
     X = resampled - center
@@ -1316,34 +1440,79 @@ def simplify_stroke_points(stroke, straightness_threshold=0.9, resample_step=15.
     direction = vecs[:, int(np.argmax(vals))]
     direction = unit(direction)
     if norm(direction) < 1e-9:
-        return np.vstack([points[0], points[-1]]), False
+        line = np.vstack([points[0], points[-1]])
+        return (line, False, metrics) if return_metrics else (line, False)
     proj = X @ direction
     line = np.vstack([center + direction * float(np.min(proj)), center + direction * float(np.max(proj))])
-    return line, True
+    return (line, True, metrics) if return_metrics else (line, True)
 
 
-def recovery_stroke_endpoints(stroke, straightness_threshold=0.9, resample_step=15.0):
+def recovery_stroke_endpoints(
+    stroke,
+    straightness_threshold=0.9,
+    resample_step=15.0,
+    curve_min_chord_px=30.0,
+    curve_min_p90_chord_dev_px=5.0,
+    curve_min_dev_ratio=0.04,
+    curve_min_pca_rms_px=2.0,
+    return_metrics=False,
+):
     line_points, is_curved = simplify_stroke_points(
         stroke,
         straightness_threshold=straightness_threshold,
         resample_step=resample_step,
+        curve_min_chord_px=curve_min_chord_px,
+        curve_min_p90_chord_dev_px=curve_min_p90_chord_dev_px,
+        curve_min_dev_ratio=curve_min_dev_ratio,
+        curve_min_pca_rms_px=curve_min_pca_rms_px,
+        return_metrics=False,
     )
+    if return_metrics:
+        _, metrics = classify_stroke_curve(
+            stroke,
+            straightness_threshold=straightness_threshold,
+            curve_min_chord_px=curve_min_chord_px,
+            curve_min_p90_chord_dev_px=curve_min_p90_chord_dev_px,
+            curve_min_dev_ratio=curve_min_dev_ratio,
+            curve_min_pca_rms_px=curve_min_pca_rms_px,
+        )
+        return line_points[0], line_points[1], is_curved, metrics
     return line_points[0], line_points[1], is_curved
 
 
-def recovery_stroke_polyline(stroke, straightness_threshold=0.9, resample_step=15.0):
+def recovery_stroke_polyline(
+    stroke,
+    straightness_threshold=0.9,
+    resample_step=15.0,
+    curve_min_chord_px=30.0,
+    curve_min_p90_chord_dev_px=5.0,
+    curve_min_dev_ratio=0.04,
+    curve_min_pca_rms_px=2.0,
+    return_metrics=False,
+):
     points = np.asarray(stroke.get("points", [stroke["p0"], stroke["p1"]]), dtype=float)
-    straightness = float(stroke.get("straightness", 1.0))
     if len(points) < 2:
-        return np.vstack([stroke["p0"], stroke["p1"]]), False
-    if straightness >= float(straightness_threshold):
-        return np.vstack([points[0], points[-1]]), False
+        metrics = stroke_curve_metrics(points, straightness=stroke.get("straightness", None))
+        line = np.vstack([stroke["p0"], stroke["p1"]])
+        return (line, False, metrics) if return_metrics else (line, False)
+    is_curve, metrics = classify_stroke_curve(
+        stroke,
+        straightness_threshold=straightness_threshold,
+        curve_min_chord_px=curve_min_chord_px,
+        curve_min_p90_chord_dev_px=curve_min_p90_chord_dev_px,
+        curve_min_dev_ratio=curve_min_dev_ratio,
+        curve_min_pca_rms_px=curve_min_pca_rms_px,
+    )
+    if not is_curve:
+        line = np.vstack([points[0], points[-1]])
+        return (line, False, metrics) if return_metrics else (line, False)
     polyline = resample_polyline_by_step(points, step=resample_step)
     if len(polyline) < 2:
-        return np.vstack([points[0], points[-1]]), False
+        line = np.vstack([points[0], points[-1]])
+        return (line, False, metrics) if return_metrics else (line, False)
     polyline[0] = points[0]
     polyline[-1] = points[-1]
-    return polyline, True
+    return (polyline, True, metrics) if return_metrics else (polyline, True)
 
 
 def orient_cap_stroke_polyline(polyline, start_group, end_group, desired_start_group=None, previous_point=None):
@@ -1361,7 +1530,16 @@ def orient_cap_stroke_polyline(polyline, start_group, end_group, desired_start_g
     return poly, start_group, end_group
 
 
-def build_cap_stroke_loop_items(cap_endpoint_source, strokes, straightness_threshold=0.9, resample_step=15.0):
+def build_cap_stroke_loop_items(
+    cap_endpoint_source,
+    strokes,
+    straightness_threshold=0.9,
+    resample_step=15.0,
+    curve_min_chord_px=30.0,
+    curve_min_p90_chord_dev_px=5.0,
+    curve_min_dev_ratio=0.04,
+    curve_min_pca_rms_px=2.0,
+):
     if not cap_endpoint_source or strokes is None:
         return []
     stroke_order = [
@@ -1380,10 +1558,15 @@ def build_cap_stroke_loop_items(cap_endpoint_source, strokes, straightness_thres
         group_info = stroke_groups.get(str(int(sid)))
         if group_info is None:
             continue
-        polyline_2d, is_curved = recovery_stroke_polyline(
+        polyline_2d, is_curved, curve_metrics = recovery_stroke_polyline(
             strokes[sid],
             straightness_threshold=straightness_threshold,
             resample_step=resample_step,
+            curve_min_chord_px=curve_min_chord_px,
+            curve_min_p90_chord_dev_px=curve_min_p90_chord_dev_px,
+            curve_min_dev_ratio=curve_min_dev_ratio,
+            curve_min_pca_rms_px=curve_min_pca_rms_px,
+            return_metrics=True,
         )
         start_group = int(group_info["start"])
         end_group = int(group_info["end"])
@@ -1408,6 +1591,7 @@ def build_cap_stroke_loop_items(cap_endpoint_source, strokes, straightness_thres
                 "stroke": int(sid),
                 "straightness": float(strokes[sid].get("straightness", 1.0)),
                 "is_curved": bool(is_curved),
+                "curve_metrics": curve_metrics,
                 "start_group_index": int(start_group),
                 "end_group_index": int(end_group),
                 "polyline_2d": polyline_2d,
@@ -1416,7 +1600,16 @@ def build_cap_stroke_loop_items(cap_endpoint_source, strokes, straightness_thres
     return items
 
 
-def normalize_cap_stroke_loop_items(cap_stroke_loop_items, strokes, straightness_threshold=0.9, resample_step=15.0):
+def normalize_cap_stroke_loop_items(
+    cap_stroke_loop_items,
+    strokes,
+    straightness_threshold=0.9,
+    resample_step=15.0,
+    curve_min_chord_px=30.0,
+    curve_min_p90_chord_dev_px=5.0,
+    curve_min_dev_ratio=0.04,
+    curve_min_pca_rms_px=2.0,
+):
     if not cap_stroke_loop_items or strokes is None:
         return cap_stroke_loop_items
     normalized = []
@@ -1426,11 +1619,17 @@ def normalize_cap_stroke_loop_items(cap_stroke_loop_items, strokes, straightness
         normalized_item = dict(item)
         stroke = strokes.get(sid)
         if stroke is not None:
-            recomputed_polyline, recomputed_is_curved = recovery_stroke_polyline(
+            recomputed_polyline, recomputed_is_curved, curve_metrics = recovery_stroke_polyline(
                 stroke,
                 straightness_threshold=straightness_threshold,
                 resample_step=resample_step,
+                curve_min_chord_px=curve_min_chord_px,
+                curve_min_p90_chord_dev_px=curve_min_p90_chord_dev_px,
+                curve_min_dev_ratio=curve_min_dev_ratio,
+                curve_min_pca_rms_px=curve_min_pca_rms_px,
+                return_metrics=True,
             )
+            normalized_item["curve_metrics"] = curve_metrics
             recomputed_polyline = np.asarray(recomputed_polyline, dtype=float)
             if recomputed_is_curved and len(recomputed_polyline) > len(polyline_2d):
                 if len(polyline_2d) >= 2:
@@ -1440,6 +1639,8 @@ def normalize_cap_stroke_loop_items(cap_stroke_loop_items, strokes, straightness
                         recomputed_polyline = recomputed_polyline[::-1].copy()
                 normalized_item["polyline_2d"] = recomputed_polyline
                 normalized_item["is_curved"] = True
+            elif not recomputed_is_curved:
+                normalized_item["is_curved"] = False
         normalized.append(normalized_item)
     return normalized
 
@@ -1705,7 +1906,17 @@ def project_polyline_to_z(polyline_2d, z_value, cal):
     return [pixel_to_world_on_z(point, z_value, cal) for point in np.asarray(polyline_2d, dtype=float)]
 
 
-def group_cap_endpoints(strokes, cap_ids, tol, straightness_threshold=0.9, resample_step=15.0):
+def group_cap_endpoints(
+    strokes,
+    cap_ids,
+    tol,
+    straightness_threshold=0.9,
+    resample_step=15.0,
+    curve_min_chord_px=30.0,
+    curve_min_p90_chord_dev_px=5.0,
+    curve_min_dev_ratio=0.04,
+    curve_min_pca_rms_px=2.0,
+):
     groups = []
     for sid in cap_ids:
         if sid in strokes:
@@ -1713,6 +1924,10 @@ def group_cap_endpoints(strokes, cap_ids, tol, straightness_threshold=0.9, resam
                 strokes[sid],
                 straightness_threshold=straightness_threshold,
                 resample_step=resample_step,
+                curve_min_chord_px=curve_min_chord_px,
+                curve_min_p90_chord_dev_px=curve_min_p90_chord_dev_px,
+                curve_min_dev_ratio=curve_min_dev_ratio,
+                curve_min_pca_rms_px=curve_min_pca_rms_px,
             )
             p0, p1 = polyline_2d[0], polyline_2d[-1]
             endpoint_pixels = {"p0": p0, "p1": p1}
@@ -1744,15 +1959,209 @@ def group_cap_endpoints(strokes, cap_ids, tol, straightness_threshold=0.9, resam
     return groups
 
 
+def cap_endpoint_member_role(member):
+    endpoint = str(member.get("graph_endpoint", member.get("endpoint", ""))).lower()
+    if endpoint in {"start", "p0"}:
+        return "start"
+    if endpoint in {"end", "p1"}:
+        return "end"
+    endpoint = str(member.get("endpoint", "")).lower()
+    if endpoint in {"start", "p0"}:
+        return "start"
+    if endpoint in {"end", "p1"}:
+        return "end"
+    return None
+
+
+def stroke_group_indices_from_cap_groups(cap_ids, cap_groups):
+    member_to_group = {}
+    for group_idx, group in enumerate(cap_groups):
+        for member in group.get("members", []):
+            role = cap_endpoint_member_role(member)
+            if role is None:
+                continue
+            member_to_group[(int(member["stroke"]), role)] = int(group_idx)
+
+    stroke_group_indices = {}
+    missing_strokes = []
+    for sid in cap_ids:
+        sid = int(sid)
+        start_group = member_to_group.get((sid, "start"))
+        end_group = member_to_group.get((sid, "end"))
+        if start_group is None or end_group is None:
+            missing_strokes.append(sid)
+            continue
+        stroke_group_indices[str(sid)] = {
+            "start": int(start_group),
+            "end": int(end_group),
+        }
+    return stroke_group_indices, missing_strokes
+
+
+def cap_stroke_order_from_group_graph(cap_ids, stroke_group_indices):
+    """Order fallback cap strokes by walking their endpoint-group graph."""
+    cap_ids = [int(sid) for sid in cap_ids if str(int(sid)) in stroke_group_indices]
+    if not cap_ids:
+        return [], {
+            "method": "fallback_endpoint_group_euler_walk",
+            "edge_count": 0,
+            "ordered_count": 0,
+            "missing_after_order": [],
+            "odd_group_indices": [],
+            "component_count": 0,
+        }
+
+    edges = []
+    for sid in cap_ids:
+        groups = stroke_group_indices[str(sid)]
+        edges.append({
+            "stroke": int(sid),
+            "start": int(groups["start"]),
+            "end": int(groups["end"]),
+        })
+
+    adjacency = {}
+    degree = {}
+    for edge_idx, edge in enumerate(edges):
+        a = int(edge["start"])
+        b = int(edge["end"])
+        adjacency.setdefault(a, []).append(edge_idx)
+        if a != b:
+            adjacency.setdefault(b, []).append(edge_idx)
+            degree[a] = degree.get(a, 0) + 1
+            degree[b] = degree.get(b, 0) + 1
+        else:
+            degree[a] = degree.get(a, 0) + 2
+
+    cap_order_pos = {sid: pos for pos, sid in enumerate(cap_ids)}
+    for edge_list in adjacency.values():
+        edge_list.sort(key=lambda idx: cap_order_pos.get(int(edges[idx]["stroke"]), idx))
+
+    def choose_start_node(available_edges):
+        available_nodes = sorted(
+            {
+                int(edges[idx]["start"])
+                for idx in available_edges
+            }
+            | {
+                int(edges[idx]["end"])
+                for idx in available_edges
+            }
+        )
+        odd_nodes = [node for node in available_nodes if degree.get(node, 0) % 2 == 1]
+        if odd_nodes:
+            return odd_nodes[0]
+        first_edge = min(available_edges, key=lambda idx: cap_order_pos.get(int(edges[idx]["stroke"]), idx))
+        return int(edges[first_edge]["start"])
+
+    used = set()
+    ordered_edge_indices = []
+    component_count = 0
+
+    while len(used) < len(edges):
+        remaining_edges = [idx for idx in range(len(edges)) if idx not in used]
+        start_node = choose_start_node(remaining_edges)
+        stack = [(start_node, None)]
+        component_edges = []
+        component_count += 1
+
+        while stack:
+            node, incoming_edge_idx = stack[-1]
+            next_edge_idx = None
+            for edge_idx in adjacency.get(node, []):
+                if edge_idx not in used:
+                    next_edge_idx = edge_idx
+                    break
+            if next_edge_idx is None:
+                _node, incoming = stack.pop()
+                if incoming is not None:
+                    component_edges.append(incoming)
+                continue
+
+            used.add(next_edge_idx)
+            edge = edges[next_edge_idx]
+            a = int(edge["start"])
+            b = int(edge["end"])
+            next_node = b if node == a else a
+            stack.append((next_node, next_edge_idx))
+
+        ordered_edge_indices.extend(reversed(component_edges))
+
+    ordered = [int(edges[idx]["stroke"]) for idx in ordered_edge_indices]
+    ordered_set = set(ordered)
+    missing_after_order = [sid for sid in cap_ids if sid not in ordered_set]
+    ordered.extend(missing_after_order)
+
+    odd_group_indices = sorted([int(node) for node, deg in degree.items() if deg % 2 == 1])
+    return ordered, {
+        "method": "fallback_endpoint_group_euler_walk",
+        "edge_count": int(len(edges)),
+        "ordered_count": int(len(ordered)),
+        "missing_after_order": [int(sid) for sid in missing_after_order],
+        "odd_group_indices": odd_group_indices,
+        "component_count": int(component_count),
+    }
+
+
+def build_fallback_cap_endpoint_source(source_path, fallback_reason, cap_ids, cap_groups, endpoint_tol):
+    stroke_group_indices, missing_strokes = stroke_group_indices_from_cap_groups(cap_ids, cap_groups)
+    ordered_strokes, order_debug = cap_stroke_order_from_group_graph(cap_ids, stroke_group_indices)
+
+    graph_edges = set()
+    stroke_edges = []
+    for sid in cap_ids:
+        group_info = stroke_group_indices.get(str(int(sid)))
+        if group_info is None:
+            continue
+        start_group = int(group_info["start"])
+        end_group = int(group_info["end"])
+        stroke_edges.append({
+            "stroke": int(sid),
+            "start_group": start_group,
+            "end_group": end_group,
+        })
+        if start_group != end_group:
+            graph_edges.add(tuple(sorted((start_group, end_group))))
+
+    return {
+        "source": str(source_path),
+        "fallback_reason": fallback_reason,
+        "method": "fallback_endpoint_groups_from_stroke_directions",
+        "endpoint_group_tolerance_pixels": float(endpoint_tol),
+        "raw_endpoint_count": int(sum(len(g.get("members", [])) for g in cap_groups)),
+        "post_snap_endpoint_group_count": int(len(cap_groups)),
+        "pruned_strokes": [int(sid) for sid in cap_ids],
+        "component_strokes_in_order": [int(sid) for sid in ordered_strokes],
+        "fallback_missing_strokes": [int(sid) for sid in missing_strokes],
+        "fallback_order_debug": order_debug,
+        "graph_edges_group_indices": [[int(a), int(b)] for a, b in sorted(graph_edges)],
+        "stroke_edges_group_indices": stroke_edges,
+        "stroke_group_indices": stroke_group_indices,
+    }
+
+
 def min_distance_to_cap(point, cap_groups):
     return min(norm(point - g["center"]) for g in cap_groups)
 
 
-def orient_side_stroke(stroke, cap_groups, straightness_threshold=0.9, resample_step=15.0):
+def orient_side_stroke(
+    stroke,
+    cap_groups,
+    straightness_threshold=0.9,
+    resample_step=15.0,
+    curve_min_chord_px=30.0,
+    curve_min_p90_chord_dev_px=5.0,
+    curve_min_dev_ratio=0.04,
+    curve_min_pca_rms_px=2.0,
+):
     polyline_2d, is_curved = recovery_stroke_polyline(
         stroke,
         straightness_threshold=straightness_threshold,
         resample_step=resample_step,
+        curve_min_chord_px=curve_min_chord_px,
+        curve_min_p90_chord_dev_px=curve_min_p90_chord_dev_px,
+        curve_min_dev_ratio=curve_min_dev_ratio,
+        curve_min_pca_rms_px=curve_min_pca_rms_px,
     )
     p0, p1 = polyline_2d[0], polyline_2d[-1]
     d0 = min_distance_to_cap(p0, cap_groups)
@@ -2644,6 +3053,30 @@ def main():
         help="Arc-length step, in pixels, used to resample curved 2D strokes before straight-line simplification.",
     )
     parser.add_argument(
+        "--curve-min-chord-px",
+        type=float,
+        default=30.0,
+        help="Minimum stroke endpoint chord length required before a stroke can be treated as a curve.",
+    )
+    parser.add_argument(
+        "--curve-min-p90-chord-dev-px",
+        type=float,
+        default=5.0,
+        help="Minimum 90th-percentile distance from the endpoint chord required before a stroke can be treated as a curve.",
+    )
+    parser.add_argument(
+        "--curve-min-dev-ratio",
+        type=float,
+        default=0.04,
+        help="Minimum p90 chord-deviation divided by chord length required before a stroke can be treated as a curve.",
+    )
+    parser.add_argument(
+        "--curve-min-pca-rms-px",
+        type=float,
+        default=2.0,
+        help="Minimum RMS distance from the PCA fitted line required before a stroke can be treated as a curve.",
+    )
+    parser.add_argument(
         "--reconstruct-blender",
         action="store_true",
         help="Use Blender to rebuild a 3D scene from the generated endpoint JSON.",
@@ -2738,19 +3171,34 @@ def main():
             strokes=strokes,
             straightness_threshold=args.curve_straightness_thresh,
             resample_step=args.curve_resample_step_px,
+            curve_min_chord_px=args.curve_min_chord_px,
+            curve_min_p90_chord_dev_px=args.curve_min_p90_chord_dev_px,
+            curve_min_dev_ratio=args.curve_min_dev_ratio,
+            curve_min_pca_rms_px=args.curve_min_pca_rms_px,
         )
         if cap_groups is None:
+            fallback_reason = cap_endpoint_source
             cap_groups = group_cap_endpoints(
                 strokes,
                 selected["best_cap_strokes"],
                 args.endpoint_group_tol,
                 straightness_threshold=args.curve_straightness_thresh,
                 resample_step=args.curve_resample_step_px,
+                curve_min_chord_px=args.curve_min_chord_px,
+                curve_min_p90_chord_dev_px=args.curve_min_p90_chord_dev_px,
+                curve_min_dev_ratio=args.curve_min_dev_ratio,
+                curve_min_pca_rms_px=args.curve_min_pca_rms_px,
             )
-            cap_endpoint_source = {
-                "source": str(debug_dir / "05a_stroke_directions.txt"),
-                "fallback_reason": cap_endpoint_source,
-            }
+            fallback_source = debug_dir / "05a_stroke_directions.json"
+            if not fallback_source.exists():
+                fallback_source = debug_dir / "05a_stroke_directions.txt"
+            cap_endpoint_source = build_fallback_cap_endpoint_source(
+                fallback_source,
+                fallback_reason,
+                selected["best_cap_strokes"],
+                cap_groups,
+                args.endpoint_group_tol,
+            )
         endpoint_debug_output = Path(args.cap_endpoint_debug_output)
         if not endpoint_debug_output.is_absolute():
             endpoint_debug_output = Path.cwd() / endpoint_debug_output
@@ -2771,6 +3219,10 @@ def main():
                 cap_groups,
                 straightness_threshold=args.curve_straightness_thresh,
                 resample_step=args.curve_resample_step_px,
+                curve_min_chord_px=args.curve_min_chord_px,
+                curve_min_p90_chord_dev_px=args.curve_min_p90_chord_dev_px,
+                curve_min_dev_ratio=args.curve_min_dev_ratio,
+                curve_min_pca_rms_px=args.curve_min_pca_rms_px,
             )
             for sid in selected["side"]
         ]
@@ -2910,12 +3362,20 @@ def main():
         strokes,
         straightness_threshold=args.curve_straightness_thresh,
         resample_step=args.curve_resample_step_px,
+        curve_min_chord_px=args.curve_min_chord_px,
+        curve_min_p90_chord_dev_px=args.curve_min_p90_chord_dev_px,
+        curve_min_dev_ratio=args.curve_min_dev_ratio,
+        curve_min_pca_rms_px=args.curve_min_pca_rms_px,
     )
     cap_stroke_loop_items = normalize_cap_stroke_loop_items(
         cap_stroke_loop_items,
         strokes,
         straightness_threshold=args.curve_straightness_thresh,
         resample_step=args.curve_resample_step_px,
+        curve_min_chord_px=args.curve_min_chord_px,
+        curve_min_p90_chord_dev_px=args.curve_min_p90_chord_dev_px,
+        curve_min_dev_ratio=args.curve_min_dev_ratio,
+        curve_min_pca_rms_px=args.curve_min_pca_rms_px,
     )
     cap_stroke_loop_items, cap_loop_order_debug = validate_cap_stroke_loop_order(cap_stroke_loop_items)
     for item in cap_stroke_loop_items:
@@ -2925,6 +3385,7 @@ def main():
             "stroke": int(item["stroke"]),
             "straightness": float(item["straightness"]),
             "is_curved": bool(item["is_curved"]),
+            "curve_metrics": item.get("curve_metrics", {}),
             "polyline_point_count": int(len(source_polyline_2d)),
             "start_group_index": int(item["start_group_index"]),
             "end_group_index": int(item["end_group_index"]),
