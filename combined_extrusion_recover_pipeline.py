@@ -50,6 +50,42 @@ def main():
         default=0.85,
         help="Forwarded to the extrusion script. Hard prefilter for side-stroke clustering before PCA direction grouping.",
     )
+    parser.add_argument(
+        "--side-min-chord-px",
+        type=float,
+        default=25.0,
+        help="Forwarded to the extrusion script. Minimum endpoint chord length for side-stroke clustering.",
+    )
+    parser.add_argument(
+        "--side-line-p90-error-px",
+        type=float,
+        default=4.0,
+        help="Forwarded to the extrusion script. Absolute p90 distance-to-PCA-line limit for side-stroke clustering.",
+    )
+    parser.add_argument(
+        "--side-line-p90-error-ratio",
+        type=float,
+        default=0.035,
+        help="Forwarded to the extrusion script. Relative p90 distance-to-PCA-line limit, multiplied by chord length.",
+    )
+    parser.add_argument(
+        "--side-line-rms-error-px",
+        type=float,
+        default=2.5,
+        help="Forwarded to the extrusion script. Absolute RMS distance-to-PCA-line limit for side-stroke clustering.",
+    )
+    parser.add_argument(
+        "--side-line-rms-error-ratio",
+        type=float,
+        default=0.025,
+        help="Forwarded to the extrusion script. Relative RMS distance-to-PCA-line limit, multiplied by chord length.",
+    )
+    parser.add_argument(
+        "--side-chord-dev-ratio-max",
+        type=float,
+        default=0.08,
+        help="Forwarded to the extrusion script. Maximum p90 endpoint-chord deviation divided by chord length for side-stroke clustering.",
+    )
     parser.add_argument("--min-stroke-length", type=float, default=25)
     parser.add_argument("--parallel-angle-thresh", type=float, default=15)
     parser.add_argument(
@@ -80,6 +116,12 @@ def main():
         type=float,
         default=0.0,
         help="Forwarded to the extrusion script. Only stop cap search when a removal-depth round contains a cap sweep whose IoU against the input enclosed mask reaches this threshold.",
+    )
+    parser.add_argument(
+        "--side-cap-connect-tol",
+        type=float,
+        default=20.0,
+        help="Forwarded to the extrusion script. Require every final side stroke to have an endpoint near the selected cap; <=0 disables this gate.",
     )
     parser.add_argument("--min-cap-total-arc", type=float, default=50)
     parser.add_argument("--split-segment-arc", type=float, default=30)
@@ -221,6 +263,18 @@ def main():
             str(args.straightness),
             "--side-straightness",
             str(args.side_straightness),
+            "--side-min-chord-px",
+            str(args.side_min_chord_px),
+            "--side-line-p90-error-px",
+            str(args.side_line_p90_error_px),
+            "--side-line-p90-error-ratio",
+            str(args.side_line_p90_error_ratio),
+            "--side-line-rms-error-px",
+            str(args.side_line_rms_error_px),
+            "--side-line-rms-error-ratio",
+            str(args.side_line_rms_error_ratio),
+            "--side-chord-dev-ratio-max",
+            str(args.side_chord_dev_ratio_max),
             "--min-stroke-length",
             str(args.min_stroke_length),
             "--parallel-angle-thresh",
@@ -243,6 +297,8 @@ def main():
             str(args.min_cap_bbox_area),
             "--cap-sweep-iou-stop-thresh",
             str(args.cap_sweep_iou_stop_thresh),
+            "--side-cap-connect-tol",
+            str(args.side_cap_connect_tol),
             "--min-cap-total-arc",
             str(args.min_cap_total_arc),
             "--split-segment-arc",

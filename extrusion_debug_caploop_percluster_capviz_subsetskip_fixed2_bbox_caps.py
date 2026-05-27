@@ -4,10 +4,12 @@
 # avoiding false junctions caused by 8-neighbor stair-step skeleton artifacts.
 
 import argparse
+from datetime import datetime
 import json
 import math
 import os
 import re
+import shutil
 
 import cv2
 import numpy as np
@@ -1159,6 +1161,64 @@ def stroke_straightness(points):
     return chord / arc
 
 
+def line_distance_values(points, line):
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) == 0:
+        return np.zeros(0, dtype=np.float64)
+    a, b, c = np.asarray(line, dtype=np.float64)
+    return np.abs(a * pts[:, 0] + b * pts[:, 1] + c)
+
+
+def chord_line_from_points(points):
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) < 2:
+        return None
+    p0 = pts[0]
+    p1 = pts[-1]
+    v = p1 - p0
+    n = np.linalg.norm(v)
+    if n < 1e-8:
+        return None
+    normal = np.array([-v[1], v[0]], dtype=np.float64) / n
+    c = -float(np.dot(normal, p0))
+    return np.array([normal[0], normal[1], c], dtype=np.float64)
+
+
+def stroke_linearity_metrics(points, pca_line=None):
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) == 0:
+        return {
+            "p90_pca_line_error": 0.0,
+            "pca_rms_error": 0.0,
+            "p90_chord_deviation": 0.0,
+            "chord_deviation_ratio": float("inf"),
+        }
+
+    if pca_line is None:
+        pca_line, _, _ = fit_line_to_points(pts)
+
+    pca_dist = line_distance_values(pts, pca_line)
+    p90_pca = float(np.percentile(pca_dist, 90)) if len(pca_dist) else 0.0
+    pca_rms = float(np.sqrt(np.mean(pca_dist * pca_dist))) if len(pca_dist) else 0.0
+
+    chord = stroke_chord_length(pts)
+    chord_line = chord_line_from_points(pts)
+    if chord_line is None or chord < 1e-8:
+        p90_chord = 0.0
+        chord_ratio = float("inf")
+    else:
+        chord_dist = line_distance_values(pts, chord_line)
+        p90_chord = float(np.percentile(chord_dist, 90)) if len(chord_dist) else 0.0
+        chord_ratio = float(p90_chord / chord)
+
+    return {
+        "p90_pca_line_error": p90_pca,
+        "pca_rms_error": pca_rms,
+        "p90_chord_deviation": p90_chord,
+        "chord_deviation_ratio": chord_ratio,
+    }
+
+
 def endpoint_tangent(stroke, at_start=True, k=8):
     if len(stroke) < 2:
         return None
@@ -1351,7 +1411,8 @@ def build_stroke_infos(strokes):
         chord = stroke_chord_length(pts)
         straight = stroke_straightness(pts)
         line, direction, center = fit_line_to_points(pts)
-        infos.append({
+        linearity = stroke_linearity_metrics(pts, pca_line=line)
+        info = {
             "index": i,
             "points": pts,
             "arc": arc,
@@ -1360,7 +1421,9 @@ def build_stroke_infos(strokes):
             "line": line,
             "direction": direction,
             "center": center,
-        })
+        }
+        info.update(linearity)
+        infos.append(info)
     return infos
 
 
@@ -1583,9 +1646,8 @@ def share_any_endpoint(s1, s2, tol=12.0):
       - share_any_endpoint means they touch at one endpoint, so they are adjacent
         in the stroke graph.
 
-    For a side-direction cluster, adjacent/connected strokes usually indicate
-    a cap/contour chain rather than independent parallel side rails. Therefore
-    clusters with any connected pair are rejected by score_side_cluster().
+    For a side-direction cluster, adjacent/connected strokes can be useful debug
+    evidence, but current scoring does not reject or penalize connected pairs.
     """
     a0, a1 = stroke_endpoints(s1)
     b0, b1 = stroke_endpoints(s2)
@@ -1968,17 +2030,13 @@ def score_side_cluster(
     """
     Side-likeness score for a direction cluster.
 
-    Positive cues:
-      - more strokes in the direction family;
-      - longer total length;
-      - higher mean straightness / lower curvature;
-      - enough perpendicular spread between rails/tracks;
-      - similar stroke lengths inside the cluster.
+    Active scoring is intentionally minimal:
+      - reward only the number of strokes in the direction family;
+      - penalize same-loop endpoint pairs.
 
-    Negative cues:
-      - many pairs sharing the same two endpoints, likely a cap loop;
-      - any pair of strokes connected by one endpoint: hard reject;
-      - very low perpendicular spread for multi-stroke clusters.
+    Connected-pair, length, straightness, perpendicular spread, and
+    length-similarity metrics are still recorded for debug output, but they do
+    not affect the score.
     """
     if not cluster:
         return -1e18, {}
@@ -1990,29 +2048,13 @@ def score_side_cluster(
     connected_pairs = cluster_connected_pairs(cluster, endpoint_tol=same_loop_endpoint_tol)
     connected_pair_count = len(connected_pairs)
     length_stats = cluster_length_similarity(cluster)
-    length_similarity_bonus = float(length_similarity_weight * length_stats["length_similarity_score"])
-
+    length_similarity_bonus = 0.0
     spread_penalty = 0.0
-    if len(cluster) >= 2 and perp_spread < min_perp_spread:
-        spread_penalty = low_spread_penalty
+    count_term = float(count_weight * len(cluster))
+    same_loop_penalty_term = float(same_loop_penalty_weight * same_loop_pairs)
 
-    invalid_connected_cluster = connected_pair_count > 0
-
-    if invalid_connected_cluster:
-        # Hard reject: strokes in one direction cluster should be separate side
-        # rails/fragments, not directly connected to each other. Connected
-        # strokes are usually parts of the same cap/contour chain.
-        score = -1e18
-    else:
-        score = (
-            count_weight * len(cluster)
-            + length_weight * total_len
-            + straightness_weight * mean_straight
-            + spread_weight * perp_spread
-            + length_similarity_bonus
-            - same_loop_penalty_weight * same_loop_pairs
-            - spread_penalty
-        )
+    invalid_connected_cluster = False
+    score = count_term - same_loop_penalty_term
 
     details = {
         "n": len(cluster),
@@ -2024,6 +2066,12 @@ def score_side_cluster(
         "connected_pairs": connected_pairs,
         "invalid_connected_cluster": invalid_connected_cluster,
         "spread_penalty": spread_penalty,
+        "score_count_weight": float(count_weight),
+        "score_same_loop_penalty_weight": float(same_loop_penalty_weight),
+        "score_same_loop_endpoint_tol": float(same_loop_endpoint_tol),
+        "score_count_term": count_term,
+        "score_same_loop_penalty_term": same_loop_penalty_term,
+        "score_uses_only_count_same_loop": True,
         "length_mean": length_stats["length_mean"],
         "length_std": length_stats["length_std"],
         "length_cv": length_stats["length_cv"],
@@ -2139,21 +2187,122 @@ def point_inside_bbox(p, bbox):
     return x0 <= p[0] <= x1 and y0 <= p[1] <= y1
 
 
-def filter_side_direction_group_strokes(stroke_infos, min_length, min_straightness):
+def side_line_error_limit(chord, abs_px, ratio):
+    limits = []
+    if abs_px is not None and float(abs_px) > 0.0:
+        limits.append(float(abs_px))
+    if ratio is not None and float(ratio) > 0.0:
+        limits.append(float(chord) * float(ratio))
+    if not limits:
+        return None
+    return float(max(limits))
+
+
+def side_direction_group_filter_result(
+    s,
+    min_length,
+    min_straightness,
+    min_chord=0.0,
+    line_p90_error_px=4.0,
+    line_p90_error_ratio=0.035,
+    line_rms_error_px=2.5,
+    line_rms_error_ratio=0.025,
+    chord_dev_ratio_max=0.08,
+):
+    """Return side-line prefilter diagnostics for one stroke."""
+    arc = float(s.get("arc", 0.0))
+    chord = float(s.get("chord", 0.0))
+    straightness = float(s.get("straightness", 0.0))
+    p90_pca = float(s.get("p90_pca_line_error", float("inf")))
+    pca_rms = float(s.get("pca_rms_error", float("inf")))
+    chord_ratio = float(s.get("chord_deviation_ratio", float("inf")))
+    p90_limit = side_line_error_limit(chord, line_p90_error_px, line_p90_error_ratio)
+    rms_limit = side_line_error_limit(chord, line_rms_error_px, line_rms_error_ratio)
+
+    reasons = []
+    if arc < float(min_length):
+        reasons.append(f"arc {arc:.2f} < {float(min_length):.2f}")
+    if chord < float(min_chord):
+        reasons.append(f"chord {chord:.2f} < {float(min_chord):.2f}")
+    if straightness < float(min_straightness):
+        reasons.append(f"straightness {straightness:.3f} < {float(min_straightness):.3f}")
+    if p90_limit is not None and p90_pca > p90_limit:
+        reasons.append(f"p90_pca_line_error {p90_pca:.2f} > {p90_limit:.2f}")
+    if rms_limit is not None and pca_rms > rms_limit:
+        reasons.append(f"pca_rms_error {pca_rms:.2f} > {rms_limit:.2f}")
+    if chord_dev_ratio_max is not None and float(chord_dev_ratio_max) > 0.0:
+        if chord_ratio > float(chord_dev_ratio_max):
+            reasons.append(f"chord_dev_ratio {chord_ratio:.4f} > {float(chord_dev_ratio_max):.4f}")
+
+    failed_checks = {
+        "arc": arc < float(min_length),
+        "chord": chord < float(min_chord),
+        "straightness": straightness < float(min_straightness),
+        "p90_pca_line_error": p90_limit is not None and p90_pca > p90_limit,
+        "pca_rms_error": rms_limit is not None and pca_rms > rms_limit,
+        "chord_deviation_ratio": (
+            chord_dev_ratio_max is not None
+            and float(chord_dev_ratio_max) > 0.0
+            and chord_ratio > float(chord_dev_ratio_max)
+        ),
+    }
+
+    return {
+        "accepted": len(reasons) == 0,
+        "reasons": reasons,
+        "p90_pca_limit": p90_limit,
+        "pca_rms_limit": rms_limit,
+        "failed_checks": failed_checks,
+    }
+
+
+def filter_side_direction_group_strokes(
+    stroke_infos,
+    min_length,
+    min_straightness,
+    min_chord=0.0,
+    line_p90_error_px=4.0,
+    line_p90_error_ratio=0.035,
+    line_rms_error_px=2.5,
+    line_rms_error_ratio=0.025,
+    chord_dev_ratio_max=0.08,
+):
     """Return strokes eligible for side-direction clustering."""
-    return [
-        s for s in stroke_infos
-        if s["arc"] >= min_length and s["straightness"] >= min_straightness
-    ]
+    kept = []
+    for s in stroke_infos:
+        result = side_direction_group_filter_result(
+            s,
+            min_length=min_length,
+            min_straightness=min_straightness,
+            min_chord=min_chord,
+            line_p90_error_px=line_p90_error_px,
+            line_p90_error_ratio=line_p90_error_ratio,
+            line_rms_error_px=line_rms_error_px,
+            line_rms_error_ratio=line_rms_error_ratio,
+            chord_dev_ratio_max=chord_dev_ratio_max,
+        )
+        if result["accepted"]:
+            kept.append(s)
+    return kept
+
+
+def filter_side_direction_group_strokes_for_args(stroke_infos, args):
+    return filter_side_direction_group_strokes(
+        stroke_infos,
+        min_length=args.min_stroke_length,
+        min_straightness=args.side_straightness,
+        min_chord=args.side_min_chord_px,
+        line_p90_error_px=args.side_line_p90_error_px,
+        line_p90_error_ratio=args.side_line_p90_error_ratio,
+        line_rms_error_px=args.side_line_rms_error_px,
+        line_rms_error_ratio=args.side_line_rms_error_ratio,
+        chord_dev_ratio_max=args.side_chord_dev_ratio_max,
+    )
 
 
 def choose_extrusion_model(args, infos, img_shape, skel):
     line_strokes = [s for s in infos if s["arc"] >= args.min_stroke_length and s["straightness"] >= args.straightness]
-    direction_group_strokes = filter_side_direction_group_strokes(
-        infos,
-        min_length=args.min_stroke_length,
-        min_straightness=args.side_straightness,
-    )
+    direction_group_strokes = filter_side_direction_group_strokes_for_args(infos, args)
 
     if args.force_parallel:
         return fallback_parallel_direction(
@@ -2779,6 +2928,239 @@ def is_closed_stroke_graph(comp, endpoint_nodes):
     return all(d == 2 for d in node_degree.values())
 
 
+def build_cap_component_endpoint_graph(strokes, comp, endpoint_tol=12.0):
+    """Build an endpoint-node graph for a normalized cap component."""
+    comp = list(map(int, comp))
+    comp_strokes = [strokes[i] for i in comp]
+    endpoint_nodes, centers = stroke_endpoint_node_ids(comp_strokes, endpoint_tol=endpoint_tol)
+
+    edges = []
+    nonself_edges = []
+    self_loop_strokes = []
+    for pos, (a, b) in enumerate(endpoint_nodes):
+        edge = {
+            "edge_index": int(pos),
+            "stroke_local_i": int(comp[pos]),
+            "stroke_index": int(strokes[comp[pos]]["index"]),
+            "start_node": int(a),
+            "end_node": int(b),
+            "is_self_loop": int(a) == int(b),
+        }
+        edges.append(edge)
+        if edge["is_self_loop"]:
+            self_loop_strokes.append(edge["stroke_index"])
+        else:
+            nonself_edges.append(edge)
+
+    return {
+        "component_local_indices": comp,
+        "endpoint_centers": centers,
+        "edges": edges,
+        "nonself_edges": nonself_edges,
+        "self_loop_strokes": self_loop_strokes,
+    }
+
+
+def cap_graph_edge_components(nonself_edges):
+    """Connected components over graph edges."""
+    node_to_edges = {}
+    for ei, edge in enumerate(nonself_edges):
+        node_to_edges.setdefault(int(edge["start_node"]), []).append(ei)
+        node_to_edges.setdefault(int(edge["end_node"]), []).append(ei)
+
+    visited = set()
+    comps = []
+    for start in range(len(nonself_edges)):
+        if start in visited:
+            continue
+        stack = [start]
+        visited.add(start)
+        comp = []
+        while stack:
+            ei = stack.pop()
+            comp.append(ei)
+            edge = nonself_edges[ei]
+            for node in (int(edge["start_node"]), int(edge["end_node"])):
+                for nb in node_to_edges.get(node, []):
+                    if nb not in visited:
+                        visited.add(nb)
+                        stack.append(nb)
+        comps.append(sorted(comp))
+    return comps
+
+
+def cap_graph_component_stats(nonself_edges, edge_indices):
+    node_degree = {}
+    nodes = set()
+    for ei in edge_indices:
+        edge = nonself_edges[int(ei)]
+        a = int(edge["start_node"])
+        b = int(edge["end_node"])
+        nodes.add(a)
+        nodes.add(b)
+        node_degree[a] = node_degree.get(a, 0) + 1
+        node_degree[b] = node_degree.get(b, 0) + 1
+    edge_count = int(len(edge_indices))
+    node_count = int(len(nodes))
+    cycle_count = max(0, edge_count - node_count + 1) if edge_count > 0 else 0
+    return {
+        "edge_count": edge_count,
+        "node_count": node_count,
+        "cycle_count": int(cycle_count),
+        "node_degrees": {int(k): int(v) for k, v in sorted(node_degree.items())},
+        "all_degree_two": bool(node_degree) and all(int(v) == 2 for v in node_degree.values()),
+        "is_simple_cycle": edge_count > 0 and edge_count == node_count and all(int(v) == 2 for v in node_degree.values()),
+    }
+
+
+def enumerate_simple_edge_cycles(nonself_edges, max_cycle_edges=None, max_cycles=512):
+    """Enumerate simple cycles as edge-index sets in a small undirected multigraph."""
+    if not nonself_edges:
+        return []
+
+    max_cycle_edges = len(nonself_edges) if not max_cycle_edges else int(max_cycle_edges)
+    max_cycle_edges = max(2, min(max_cycle_edges, len(nonself_edges)))
+
+    adjacency = {}
+    nodes = set()
+    for ei, edge in enumerate(nonself_edges):
+        a = int(edge["start_node"])
+        b = int(edge["end_node"])
+        nodes.add(a)
+        nodes.add(b)
+        adjacency.setdefault(a, []).append((ei, b))
+        adjacency.setdefault(b, []).append((ei, a))
+    for items in adjacency.values():
+        items.sort(key=lambda item: (item[1], item[0]))
+
+    seen = set()
+    cycles = []
+
+    def dfs(start, node, visited_nodes, path_edges):
+        if len(cycles) >= int(max_cycles):
+            return
+        if len(path_edges) >= max_cycle_edges:
+            return
+
+        for edge_idx, nb in adjacency.get(node, []):
+            if edge_idx in path_edges:
+                continue
+            if nb == start:
+                if len(path_edges) >= 1:
+                    key = tuple(sorted(path_edges + [edge_idx]))
+                    if len(key) >= 2 and key not in seen:
+                        seen.add(key)
+                        cycles.append(list(key))
+                continue
+            if nb < start or nb in visited_nodes:
+                continue
+            dfs(start, nb, visited_nodes | {nb}, path_edges + [edge_idx])
+
+    for start in sorted(nodes):
+        dfs(start, start, {start}, [])
+        if len(cycles) >= int(max_cycles):
+            break
+
+    cycles.sort(key=lambda c: (-len(c), c))
+    return cycles
+
+
+def find_edge_disjoint_cycle_cover(nonself_edges, cycles):
+    """Return a set of cycles covering every edge exactly once, if one exists."""
+    universe = set(range(len(nonself_edges)))
+    if not universe:
+        return []
+
+    cycle_sets = [set(map(int, c)) for c in cycles]
+    edge_to_cycles = {}
+    for ci, cycle in enumerate(cycle_sets):
+        for edge_idx in cycle:
+            edge_to_cycles.setdefault(edge_idx, []).append(ci)
+
+    for edge_idx in universe:
+        if edge_idx not in edge_to_cycles:
+            return None
+
+    def search(remaining, chosen):
+        if not remaining:
+            return chosen
+        edge_idx = min(remaining, key=lambda e: len(edge_to_cycles.get(e, [])))
+        for cycle_idx in edge_to_cycles.get(edge_idx, []):
+            cycle = cycle_sets[cycle_idx]
+            if not cycle.issubset(remaining):
+                continue
+            result = search(remaining - cycle, chosen + [cycle_idx])
+            if result is not None:
+                return result
+        return None
+
+    chosen_indices = search(universe, [])
+    if chosen_indices is None:
+        return None
+    return [cycles[i] for i in chosen_indices]
+
+
+def cap_loop_components_from_topology(strokes, comp, endpoint_tol=12.0, max_loop_subset_size=14):
+    """
+    Return one or more cap loop components after endpoint-graph topology checks.
+
+    Multiple simple loops may be kept together when their edges can be covered by
+    edge-disjoint simple cycles. If the graph contains shared-edge cycles, return
+    the individual simple cycles instead of the whole component.
+    """
+    graph = build_cap_component_endpoint_graph(strokes, comp, endpoint_tol=endpoint_tol)
+    nonself_edges = graph["nonself_edges"]
+    edge_components = cap_graph_edge_components(nonself_edges)
+    component_stats = [cap_graph_component_stats(nonself_edges, c) for c in edge_components]
+    cycle_count = int(sum(item["cycle_count"] for item in component_stats))
+    max_cycle_edges = len(nonself_edges)
+    cycles = enumerate_simple_edge_cycles(nonself_edges, max_cycle_edges=max_cycle_edges)
+    cycle_cover = None
+    if not graph["self_loop_strokes"] and cycles:
+        cycle_cover = find_edge_disjoint_cycle_cover(nonself_edges, cycles)
+
+    topology = {
+        "nonself_edge_count": int(len(nonself_edges)),
+        "self_loop_strokes": list(graph["self_loop_strokes"]),
+        "edge_component_count": int(len(edge_components)),
+        "cycle_count": int(cycle_count),
+        "simple_cycle_count": int(len(cycles)),
+        "edge_disjoint_cycle_cover_found": cycle_cover is not None,
+        "edge_disjoint_cycle_cover_count": 0 if cycle_cover is None else int(len(cycle_cover)),
+        "component_stats": component_stats,
+    }
+
+    if cycle_cover is not None:
+        kind = "simple_loop" if len(cycle_cover) == 1 else "multi_simple_loop_edge_disjoint"
+        return [{
+            "component_local_indices": list(map(int, comp)),
+            "topology_kind": kind,
+            "topology": topology,
+        }]
+
+    out = []
+    seen = set()
+    max_subset_size = int(max_loop_subset_size) if max_loop_subset_size is not None else 0
+    for cycle in cycles:
+        loop_local_indices = [int(nonself_edges[ei]["stroke_local_i"]) for ei in cycle]
+        if max_subset_size > 0 and len(loop_local_indices) > max_subset_size:
+            continue
+        key = tuple(sorted(loop_local_indices))
+        if key in seen:
+            continue
+        seen.add(key)
+        cycle_strokes = [int(strokes[i]["index"]) for i in loop_local_indices]
+        cycle_topology = dict(topology)
+        cycle_topology["decomposed_from_shared_edge_graph"] = True
+        cycle_topology["cycle_strokes"] = cycle_strokes
+        out.append({
+            "component_local_indices": loop_local_indices,
+            "topology_kind": "decomposed_simple_loop",
+            "topology": cycle_topology,
+        })
+    return out
+
+
 def candidate_from_stroke_loop(shape, strokes, comp, thickness=2):
     """Create a cap-candidate record from a closed stroke-loop component."""
     loop_strokes = [strokes[i] for i in comp]
@@ -2806,6 +3188,1261 @@ def candidate_from_stroke_loop(shape, strokes, comp, thickness=2):
         "stroke_count": len(loop_strokes),
         "total_arc": total_arc,
     }
+
+
+def canonical_cycle_sequence(seq):
+    """Canonicalize a stroke-index cycle up to rotation and reversal."""
+    seq = [int(x) for x in seq]
+    if not seq:
+        return tuple()
+    variants = []
+    n = len(seq)
+    for items in (seq, list(reversed(seq))):
+        for i in range(n):
+            variants.append(tuple(items[i:] + items[:i]))
+    return min(variants)
+
+
+def endpoint_port_point(strokes, stroke_local_i, endpoint_i):
+    pts = np.asarray(strokes[int(stroke_local_i)]["points"], dtype=np.float64).reshape(-1, 2)
+    return pts[0] if int(endpoint_i) == 0 else pts[-1]
+
+
+def build_endpoint_port_connectors(strokes, comp, endpoint_tol=12.0, max_connectors_per_port=10):
+    """Build non-transitive endpoint-to-endpoint connector choices for a component."""
+    comp = [int(i) for i in comp]
+    ports = [(int(si), 0) for si in comp] + [(int(si), 1) for si in comp]
+    port_points = {p: endpoint_port_point(strokes, p[0], p[1]) for p in ports}
+    connectors = {p: [] for p in ports}
+    tol2 = float(endpoint_tol) * float(endpoint_tol)
+    for i, p in enumerate(ports):
+        for q in ports[i + 1:]:
+            if int(p[0]) == int(q[0]):
+                continue
+            d = port_points[p] - port_points[q]
+            d2 = float(np.dot(d, d))
+            if d2 > tol2:
+                continue
+            dist = float(math.sqrt(d2))
+            connectors[p].append({"to": q, "distance": dist})
+            connectors[q].append({"to": p, "distance": dist})
+
+    for p, items in connectors.items():
+        items.sort(key=lambda item: (
+            float(item["distance"]),
+            int(strokes[int(item["to"][0])]["index"]),
+            int(item["to"][1]),
+        ))
+        if max_connectors_per_port is not None and int(max_connectors_per_port) > 0:
+            connectors[p] = items[:int(max_connectors_per_port)]
+    return connectors, port_points
+
+
+def ordered_loop_points_from_port_cycle(strokes, oriented_cycle):
+    """Convert oriented strokes into one ordered closed-loop point sequence."""
+    chunks = []
+    for item in oriented_cycle:
+        si = int(item["stroke_local_i"])
+        entry_endpoint = int(item["entry_endpoint"])
+        pts = np.asarray(strokes[si]["points"], dtype=np.float64).reshape(-1, 2)
+        chunks.append(pts if entry_endpoint == 0 else pts[::-1])
+
+        next_entry = item.get("next_entry_point", None)
+        if next_entry is not None:
+            next_entry = np.asarray(next_entry, dtype=np.float64).reshape(1, 2)
+            if len(chunks[-1]) == 0 or np.linalg.norm(chunks[-1][-1] - next_entry[0]) > 1e-6:
+                chunks.append(next_entry)
+
+    if not chunks:
+        return np.empty((0, 2), dtype=np.float64)
+    return np.vstack([chunk for chunk in chunks if len(chunk) > 0])
+
+
+def remove_consecutive_duplicate_points(points, tol=1e-6):
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if len(pts) == 0:
+        return pts
+    out = [pts[0]]
+    tol2 = float(tol) * float(tol)
+    for p in pts[1:]:
+        d = p - out[-1]
+        if float(np.dot(d, d)) > tol2:
+            out.append(p)
+    if len(out) > 1:
+        d = out[0] - out[-1]
+        if float(np.dot(d, d)) <= tol2:
+            out.pop()
+    return np.asarray(out, dtype=np.float64).reshape(-1, 2)
+
+
+def remove_collinear_closed_polyline_vertices(points, tol=1e-6):
+    pts = remove_consecutive_duplicate_points(points, tol=tol)
+    if len(pts) < 4:
+        return pts
+    keep = []
+    for i, p in enumerate(pts):
+        prev_p = pts[(i - 1) % len(pts)]
+        next_p = pts[(i + 1) % len(pts)]
+        a = p - prev_p
+        b = next_p - p
+        la = float(np.linalg.norm(a))
+        lb = float(np.linalg.norm(b))
+        if la <= tol or lb <= tol:
+            continue
+        cross = abs(float(a[0] * b[1] - a[1] * b[0]))
+        dot = float(np.dot(a, b))
+        if cross <= float(tol) * max(1.0, la * lb) and dot >= -float(tol):
+            continue
+        keep.append(p)
+    if len(keep) < 3:
+        return pts
+    return np.asarray(keep, dtype=np.float64).reshape(-1, 2)
+
+
+def simplify_loop_points_for_intersection(points, approx_epsilon=1.0):
+    """Simplify ordered loop samples to a closed polyline used for intersection checks."""
+    pts = remove_consecutive_duplicate_points(points)
+    if len(pts) < 3:
+        return pts
+    epsilon = max(0.0, float(approx_epsilon))
+    if epsilon > 0.0 and len(pts) >= 4:
+        approx = cv2.approxPolyDP(
+            pts.astype(np.float32).reshape(-1, 1, 2),
+            epsilon,
+            True,
+        )
+        pts = approx.reshape(-1, 2).astype(np.float64)
+        pts = remove_consecutive_duplicate_points(pts)
+    pts = remove_collinear_closed_polyline_vertices(pts)
+    return pts
+
+
+def orientation_value(a, b, c):
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    c = np.asarray(c, dtype=np.float64)
+    return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+
+
+def point_on_segment(p, a, b, eps=1e-6):
+    p = np.asarray(p, dtype=np.float64)
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    if abs(orientation_value(a, b, p)) > float(eps):
+        return False
+    return (
+        min(a[0], b[0]) - float(eps) <= p[0] <= max(a[0], b[0]) + float(eps)
+        and min(a[1], b[1]) - float(eps) <= p[1] <= max(a[1], b[1]) + float(eps)
+    )
+
+
+def segments_intersect_2d(a, b, c, d, eps=1e-6):
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    c = np.asarray(c, dtype=np.float64)
+    d = np.asarray(d, dtype=np.float64)
+    if np.linalg.norm(a - b) <= float(eps) or np.linalg.norm(c - d) <= float(eps):
+        return False
+    if (
+        max(min(a[0], b[0]), min(c[0], d[0])) > min(max(a[0], b[0]), max(c[0], d[0])) + float(eps)
+        or max(min(a[1], b[1]), min(c[1], d[1])) > min(max(a[1], b[1]), max(c[1], d[1])) + float(eps)
+    ):
+        return False
+
+    o1 = orientation_value(a, b, c)
+    o2 = orientation_value(a, b, d)
+    o3 = orientation_value(c, d, a)
+    o4 = orientation_value(c, d, b)
+
+    if (
+        (o1 > eps and o2 < -eps or o1 < -eps and o2 > eps)
+        and (o3 > eps and o4 < -eps or o3 < -eps and o4 > eps)
+    ):
+        return True
+    if abs(o1) <= eps and point_on_segment(c, a, b, eps=eps):
+        return True
+    if abs(o2) <= eps and point_on_segment(d, a, b, eps=eps):
+        return True
+    if abs(o3) <= eps and point_on_segment(a, c, d, eps=eps):
+        return True
+    if abs(o4) <= eps and point_on_segment(b, c, d, eps=eps):
+        return True
+    return False
+
+
+def loop_self_intersection_info(points):
+    """Detect intersections between non-adjacent segments of a closed polyline."""
+    pts = simplify_loop_points_for_intersection(points)
+    info = {
+        "self_intersecting": False,
+        "reason": "",
+        "simplified_vertex_count": int(len(pts)),
+        "intersections": [],
+    }
+    n = int(len(pts))
+    if n < 3:
+        info["self_intersecting"] = True
+        info["reason"] = "loop_too_short_after_simplification"
+        return info
+
+    seg_starts = pts
+    seg_ends = np.roll(pts, -1, axis=0)
+    min_x = np.minimum(seg_starts[:, 0], seg_ends[:, 0])
+    max_x = np.maximum(seg_starts[:, 0], seg_ends[:, 0])
+    min_y = np.minimum(seg_starts[:, 1], seg_ends[:, 1])
+    max_y = np.maximum(seg_starts[:, 1], seg_ends[:, 1])
+    eps = 1e-6
+
+    for i in range(n):
+        a = seg_starts[i]
+        b = seg_ends[i]
+        for j in range(i + 1, n):
+            if j == i:
+                continue
+            if abs(i - j) == 1:
+                continue
+            if i == 0 and j == n - 1:
+                continue
+            if (
+                max(min_x[i], min_x[j]) > min(max_x[i], max_x[j]) + eps
+                or max(min_y[i], min_y[j]) > min(max_y[i], max_y[j]) + eps
+            ):
+                continue
+            c = seg_starts[j]
+            d = seg_ends[j]
+            if segments_intersect_2d(a, b, c, d):
+                info["self_intersecting"] = True
+                info["reason"] = "self_intersecting_loop"
+                info["intersections"].append({
+                    "segment_a": int(i),
+                    "segment_b": int(j),
+                    "a0": [float(a[0]), float(a[1])],
+                    "a1": [float(b[0]), float(b[1])],
+                    "b0": [float(c[0]), float(c[1])],
+                    "b1": [float(d[0]), float(d[1])],
+                })
+                return info
+    return info
+
+
+def candidate_from_ordered_loop(shape, strokes, loop_info, thickness=2):
+    """Create a cap candidate from an explicitly ordered endpoint-port cycle."""
+    loop_comp = [int(i) for i in loop_info.get("component_local_indices", [])]
+    loop_strokes = [strokes[i] for i in loop_comp]
+    loop_points = np.asarray(loop_info.get("ordered_loop_points", []), dtype=np.float64).reshape(-1, 2)
+    if len(loop_points) < 3:
+        return None
+    self_intersection = loop_self_intersection_info(loop_points)
+    loop_info["self_intersection"] = json_safe_debug_value(self_intersection)
+    if self_intersection.get("self_intersecting", False):
+        loop_info["reject_reason"] = "self_intersecting_loop"
+        return None
+
+    mask = np.zeros(shape[:2], dtype=np.uint8)
+    pts_i = np.rint(loop_points).astype(np.int32).reshape(-1, 1, 2)
+    cv2.polylines(mask, [pts_i], True, 255, max(1, int(thickness)), cv2.LINE_AA)
+    mask = cv2.dilate(mask, np.ones((2, 2), np.uint8), iterations=1)
+    enclosed_area, enclosed_mask = estimate_enclosed_area_from_loop_mask(mask)
+
+    cap_pixels_mask = ((mask > 0) | (enclosed_mask > 0)).astype(np.uint8)
+    ys, xs = np.where(cap_pixels_mask > 0)
+    bbox_meta = bbox_for_points(list(zip(xs.tolist(), ys.tolist())))
+    stroke_pts = np.vstack([s["points"] for s in loop_strokes]) if loop_strokes else loop_points
+    center = stroke_pts.mean(axis=0).astype(np.float64)
+    area = int(np.count_nonzero(mask))
+    total_arc = float(sum(s["arc"] for s in loop_strokes))
+    return {
+        "mask": mask,
+        "enclosed_mask": enclosed_mask,
+        "area": area,
+        "enclosed_area": int(enclosed_area),
+        "bbox": None if bbox_meta is None else bbox_meta.get("bbox"),
+        "bbox_area": 0 if bbox_meta is None else int(bbox_meta.get("bbox_area", 0)),
+        "endpoints": 0,
+        "closedness": 1.0,
+        "score": float(enclosed_area + area + total_arc),
+        "center": center,
+        "stroke_indices": [int(s["index"]) for s in loop_strokes],
+        "stroke_count": len(loop_strokes),
+        "total_arc": total_arc,
+        "ordered_loop_points": [[float(x), float(y)] for x, y in loop_points.tolist()],
+        "ordered_cycle_strokes": [int(s["index"]) for s in loop_strokes],
+        "ordered_cycle": json_safe_debug_value(loop_info.get("ordered_cycle", [])),
+        "connector_edges": json_safe_debug_value(loop_info.get("connector_edges", [])),
+        "connector_total_gap": float(loop_info.get("connector_total_gap", 0.0)),
+        "connector_max_gap": float(loop_info.get("connector_max_gap", 0.0)),
+        "self_intersection": json_safe_debug_value(self_intersection),
+    }
+
+
+def signed_polyline_area(points):
+    """Signed polygon area for an ordered closed polyline."""
+    pts = remove_consecutive_duplicate_points(points)
+    if len(pts) < 3:
+        return 0.0
+    x = pts[:, 0]
+    y = pts[:, 1]
+    return float(0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+
+
+def first_nonzero_halfedge_vector(points, fallback, eps=1e-6):
+    """Return the first usable tangent vector from the start of a halfedge."""
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if len(pts) >= 2:
+        start = pts[0]
+        for p in pts[1:]:
+            v = p - start
+            if float(np.dot(v, v)) > float(eps) * float(eps):
+                return v
+    return np.asarray(fallback, dtype=np.float64)
+
+
+def ordered_points_from_halfedges(halfedges, face_halfedge_ids):
+    """Concatenate halfedge geometry into one ordered closed boundary."""
+    chunks = []
+    for he_id in face_halfedge_ids:
+        pts = np.asarray(halfedges[int(he_id)]["points"], dtype=np.float64).reshape(-1, 2)
+        if len(pts) == 0:
+            continue
+        if not chunks:
+            chunks.append(pts)
+            continue
+        prev = chunks[-1][-1]
+        if float(np.dot(prev - pts[0], prev - pts[0])) <= 1e-12:
+            chunks.append(pts[1:])
+        else:
+            chunks.append(pts)
+    if not chunks:
+        return np.empty((0, 2), dtype=np.float64)
+    return remove_consecutive_duplicate_points(np.vstack([chunk for chunk in chunks if len(chunk) > 0]))
+
+
+def canonical_face_halfedge_signature(face_halfedge_ids):
+    """Canonical directed halfedge cycle signature up to rotation."""
+    seq = [int(x) for x in face_halfedge_ids]
+    if not seq:
+        return tuple()
+    variants = []
+    for i in range(len(seq)):
+        variants.append(tuple(seq[i:] + seq[:i]))
+    return min(variants)
+
+
+def build_stroke_first_planar_graph(strokes, comp, endpoint_tol=12.0, max_connectors_per_endpoint=2):
+    """
+    Build a planar graph without collapsing short strokes.
+
+    Every real stroke endpoint first becomes its own graph node, and every
+    stroke becomes a real graph edge. Short gap connectors are added afterwards
+    between nearby endpoints, so short strokes cannot disappear into one
+    endpoint cluster before face extraction.
+    """
+    comp = list(map(int, comp))
+    nodes = []
+    port_to_node = {}
+    for si in comp:
+        pts = np.asarray(strokes[int(si)]["points"], dtype=np.float64).reshape(-1, 2)
+        if len(pts) == 0:
+            continue
+        for endpoint_i, point in ((0, pts[0]), (1, pts[-1])):
+            node_id = len(nodes)
+            node = {
+                "node_id": int(node_id),
+                "point": np.asarray(point, dtype=np.float64).reshape(2),
+                "stroke_local_i": int(si),
+                "stroke_index": int(strokes[int(si)]["index"]),
+                "endpoint": int(endpoint_i),
+            }
+            nodes.append(node)
+            port_to_node[(int(si), int(endpoint_i))] = int(node_id)
+
+    edges = []
+
+    def add_edge(edge_kind, start_node, end_node, stroke_local_i=-1, connector_distance=0.0):
+        edge_index = len(edges)
+        start_node = int(start_node)
+        end_node = int(end_node)
+        start_meta = nodes[start_node]
+        end_meta = nodes[end_node]
+        if edge_kind == "stroke":
+            stroke_index = int(strokes[int(stroke_local_i)]["index"])
+            start_endpoint = 0
+            end_endpoint = 1
+        else:
+            stroke_index = -1
+            start_endpoint = int(start_meta["endpoint"])
+            end_endpoint = int(end_meta["endpoint"])
+        edge = {
+            "edge_index": int(edge_index),
+            "edge_kind": str(edge_kind),
+            "stroke_local_i": int(stroke_local_i),
+            "stroke_index": int(stroke_index),
+            "start_node": int(start_node),
+            "end_node": int(end_node),
+            "start_stroke": int(start_meta["stroke_index"]),
+            "start_endpoint": int(start_endpoint),
+            "end_stroke": int(end_meta["stroke_index"]),
+            "end_endpoint": int(end_endpoint),
+            "connector_distance": float(connector_distance),
+            "is_connector": edge_kind == "connector",
+        }
+        edges.append(edge)
+        return edge
+
+    real_edges = []
+    for si in comp:
+        start_node = port_to_node.get((int(si), 0), None)
+        end_node = port_to_node.get((int(si), 1), None)
+        if start_node is None or end_node is None:
+            continue
+        real_edges.append(add_edge("stroke", start_node, end_node, stroke_local_i=int(si)))
+
+    connector_candidates = []
+    tol2 = float(endpoint_tol) * float(endpoint_tol)
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            if int(nodes[i]["stroke_local_i"]) == int(nodes[j]["stroke_local_i"]):
+                continue
+            d = nodes[i]["point"] - nodes[j]["point"]
+            d2 = float(np.dot(d, d))
+            if d2 > tol2:
+                continue
+            connector_candidates.append({
+                "a": int(i),
+                "b": int(j),
+                "distance": float(math.sqrt(d2)),
+            })
+    connector_candidates.sort(key=lambda item: (
+        float(item["distance"]),
+        int(nodes[int(item["a"])]["stroke_index"]),
+        int(nodes[int(item["a"])]["endpoint"]),
+        int(nodes[int(item["b"])]["stroke_index"]),
+        int(nodes[int(item["b"])]["endpoint"]),
+    ))
+
+    connector_degree = {int(node["node_id"]): 0 for node in nodes}
+    connector_pairs = set()
+    connector_edges = []
+    max_connectors_per_endpoint = max(1, int(max_connectors_per_endpoint))
+
+    def add_connector(candidate):
+        a = int(candidate["a"])
+        b = int(candidate["b"])
+        key = tuple(sorted((a, b)))
+        if key in connector_pairs:
+            return False
+        connector_pairs.add(key)
+        connector_degree[a] = int(connector_degree.get(a, 0)) + 1
+        connector_degree[b] = int(connector_degree.get(b, 0)) + 1
+        connector_edges.append(add_edge(
+            "connector",
+            a,
+            b,
+            stroke_local_i=-1,
+            connector_distance=float(candidate["distance"]),
+        ))
+        return True
+
+    # First pass: greedily match nearest open endpoints. This is the normal
+    # stroke-first closure path and avoids creating dense connector cliques.
+    for candidate in connector_candidates:
+        a = int(candidate["a"])
+        b = int(candidate["b"])
+        if connector_degree.get(a, 0) == 0 and connector_degree.get(b, 0) == 0:
+            add_connector(candidate)
+
+    # Second pass: if a remaining endpoint still has no connector, attach it to
+    # its nearest available endpoint. This handles small junction ambiguities
+    # without connecting every endpoint pair within the tolerance.
+    for candidate in connector_candidates:
+        a = int(candidate["a"])
+        b = int(candidate["b"])
+        deg_a = int(connector_degree.get(a, 0))
+        deg_b = int(connector_degree.get(b, 0))
+        if deg_a > 0 and deg_b > 0:
+            continue
+        if deg_a >= max_connectors_per_endpoint or deg_b >= max_connectors_per_endpoint:
+            continue
+        add_connector(candidate)
+
+    unmatched_nodes = [
+        int(node_id)
+        for node_id, degree in sorted(connector_degree.items())
+        if int(degree) == 0
+    ]
+    return {
+        "component_local_indices": list(map(int, comp)),
+        "nodes": nodes,
+        "endpoint_centers": [node["point"] for node in nodes],
+        "edges": edges,
+        "real_edges": real_edges,
+        "connector_edges": connector_edges,
+        "connector_candidates": connector_candidates,
+        "connector_degree": {int(k): int(v) for k, v in connector_degree.items()},
+        "unmatched_endpoint_nodes": unmatched_nodes,
+        "self_loop_strokes": [],
+        "strategy": "stroke_first_nearest_gap_connectors",
+    }
+
+
+def extract_planar_face_loop_infos(
+    strokes,
+    comp,
+    endpoint_tol=12.0,
+    min_abs_area=1.0,
+    progress_callback=None,
+    progress_context=None,
+):
+    """
+    Extract bounded faces from a stroke-first planar graph.
+
+    The normalized component is already closed in endpoint proximity. This pass
+    keeps every stroke as a real edge first, then adds short virtual connector
+    edges for remaining endpoint gaps before walking the planar half-edge
+    embedding.
+    """
+    comp = list(map(int, comp))
+    context = {} if progress_context is None else dict(progress_context)
+    if progress_callback is not None:
+        progress_callback(
+            "planar_face_extraction_started",
+            **context,
+            component_local_indices=comp,
+            component_stroke_indices=[int(strokes[int(i)]["index"]) for i in comp],
+            endpoint_tol=float(endpoint_tol),
+        )
+
+    graph = build_stroke_first_planar_graph(strokes, comp, endpoint_tol=endpoint_tol)
+    nodes = list(graph.get("nodes", []))
+    centers = [np.asarray(c, dtype=np.float64).reshape(2) for c in graph.get("endpoint_centers", [])]
+    graph_edges = list(graph.get("edges", []))
+    real_edges = list(graph.get("real_edges", []))
+    connector_edges = list(graph.get("connector_edges", []))
+    if not centers or not graph_edges:
+        if progress_callback is not None:
+            progress_callback(
+                "planar_face_extraction_finished",
+                **context,
+                bounded_face_count=0,
+                raw_face_count=0,
+                reason="empty_graph",
+                graph_summary={
+                    "node_count": int(len(centers)),
+                    "real_edge_count": int(len(real_edges)),
+                    "connector_edge_count": int(len(connector_edges)),
+                    "unmatched_endpoint_count": int(len(graph.get("unmatched_endpoint_nodes", []))),
+                    "strategy": graph.get("strategy", ""),
+                },
+            )
+        return []
+
+    halfedges = []
+    outgoing = {}
+
+    def add_halfedge(edge, from_node, to_node, points, twin_id=None):
+        he_id = len(halfedges)
+        fallback = centers[int(to_node)] - centers[int(from_node)]
+        tangent = first_nonzero_halfedge_vector(points, fallback)
+        angle = float(math.atan2(float(tangent[1]), float(tangent[0])))
+        halfedges.append({
+            "id": int(he_id),
+            "twin": None if twin_id is None else int(twin_id),
+            "edge_index": int(edge["edge_index"]),
+            "edge_kind": edge.get("edge_kind", "stroke"),
+            "stroke_local_i": int(edge["stroke_local_i"]),
+            "stroke_index": int(edge["stroke_index"]),
+            "from_node": int(from_node),
+            "to_node": int(to_node),
+            "points": np.asarray(points, dtype=np.float64).reshape(-1, 2),
+            "angle": angle,
+            "connector_distance": float(edge.get("connector_distance", 0.0)),
+        })
+        outgoing.setdefault(int(from_node), []).append(he_id)
+        return he_id
+
+    for edge in graph_edges:
+        start_node = int(edge["start_node"])
+        end_node = int(edge["end_node"])
+        if start_node < 0 or end_node < 0 or start_node >= len(centers) or end_node >= len(centers):
+            continue
+        if edge.get("edge_kind") == "connector":
+            pts = np.asarray([centers[start_node], centers[end_node]], dtype=np.float64).reshape(-1, 2)
+        else:
+            pts = np.asarray(strokes[int(edge["stroke_local_i"])]["points"], dtype=np.float64).reshape(-1, 2)
+        if len(pts) < 2:
+            continue
+        pts_uv = pts.copy()
+        pts_uv[0] = centers[start_node]
+        pts_uv[-1] = centers[end_node]
+        pts_vu = pts_uv[::-1].copy()
+        he_uv = add_halfedge(edge, start_node, end_node, pts_uv)
+        he_vu = add_halfedge(edge, end_node, start_node, pts_vu, twin_id=he_uv)
+        halfedges[he_uv]["twin"] = int(he_vu)
+
+    if not halfedges:
+        if progress_callback is not None:
+            progress_callback(
+                "planar_face_extraction_finished",
+                **context,
+                bounded_face_count=0,
+                raw_face_count=0,
+                reason="empty_halfedge_graph",
+                graph_summary={
+                    "node_count": int(len(centers)),
+                    "real_edge_count": int(len(real_edges)),
+                    "connector_edge_count": int(len(connector_edges)),
+                    "unmatched_endpoint_count": int(len(graph.get("unmatched_endpoint_nodes", []))),
+                    "strategy": graph.get("strategy", ""),
+                },
+            )
+        return []
+
+    halfedge_pos_at_node = {}
+    for node, items in outgoing.items():
+        items.sort(key=lambda he_id: (
+            float(halfedges[int(he_id)]["angle"]),
+            int(halfedges[int(he_id)]["stroke_index"]),
+            int(halfedges[int(he_id)]["edge_index"]),
+            int(halfedges[int(he_id)]["to_node"]),
+        ))
+        for pos, he_id in enumerate(items):
+            halfedge_pos_at_node[int(he_id)] = int(pos)
+
+    visited = set()
+    raw_faces = []
+    max_steps = max(1, len(halfedges) + 1)
+    for start_id in range(len(halfedges)):
+        if start_id in visited:
+            continue
+        cur = int(start_id)
+        face_halfedges = []
+        closed = False
+        for _step in range(max_steps):
+            if cur in visited:
+                closed = cur == start_id
+                break
+            visited.add(cur)
+            face_halfedges.append(cur)
+            he = halfedges[cur]
+            twin = int(he["twin"])
+            at_node = int(he["to_node"])
+            ring = outgoing.get(at_node, [])
+            if not ring:
+                break
+            twin_pos = halfedge_pos_at_node.get(twin, None)
+            if twin_pos is None:
+                break
+            # Previous in CCW order traces the next face adjacent to this directed edge.
+            cur = int(ring[(int(twin_pos) - 1) % len(ring)])
+            if cur == start_id:
+                closed = True
+                break
+        if not closed or len(face_halfedges) < 2:
+            continue
+        signature = canonical_face_halfedge_signature(face_halfedges)
+        if any(signature == item.get("signature") for item in raw_faces):
+            continue
+        points = ordered_points_from_halfedges(halfedges, face_halfedges)
+        area = signed_polyline_area(points)
+        stroke_ids = []
+        local_indices = []
+        face_connectors = []
+        connector_gaps = []
+        for he_id in face_halfedges:
+            he = halfedges[int(he_id)]
+            if he.get("edge_kind") == "connector":
+                edge = graph_edges[int(he["edge_index"])]
+                gap = float(edge.get("connector_distance", 0.0))
+                connector_gaps.append(gap)
+                face_connectors.append({
+                    "from_stroke": int(nodes[int(he["from_node"])]["stroke_index"]),
+                    "from_endpoint": int(nodes[int(he["from_node"])]["endpoint"]),
+                    "to_stroke": int(nodes[int(he["to_node"])]["stroke_index"]),
+                    "to_endpoint": int(nodes[int(he["to_node"])]["endpoint"]),
+                    "from_node": int(he["from_node"]),
+                    "to_node": int(he["to_node"]),
+                    "distance": gap,
+                })
+                continue
+            stroke_ids.append(int(he["stroke_index"]))
+            local_indices.append(int(he["stroke_local_i"]))
+        raw_faces.append({
+            "signature": signature,
+            "halfedge_ids": list(map(int, face_halfedges)),
+            "ordered_loop_points": points,
+            "signed_area": float(area),
+            "abs_area": float(abs(area)),
+            "stroke_indices": stroke_ids,
+            "component_local_indices": local_indices,
+            "connector_edges": face_connectors,
+            "connector_total_gap": float(sum(connector_gaps)),
+            "connector_max_gap": 0.0 if not connector_gaps else float(max(connector_gaps)),
+        })
+
+    area_faces = [face for face in raw_faces if float(face.get("abs_area", 0.0)) >= float(min_abs_area)]
+    outer_face_i = None
+    if area_faces:
+        outer_face_i = max(range(len(area_faces)), key=lambda i: float(area_faces[i].get("abs_area", 0.0)))
+
+    bounded_faces = []
+    seen_face_keys = set()
+    for i, face in enumerate(area_faces):
+        if outer_face_i is not None and int(i) == int(outer_face_i) and len(area_faces) > 1:
+            continue
+        local_indices = [int(x) for x in face.get("component_local_indices", [])]
+        ordered_points = np.asarray(face.get("ordered_loop_points", []), dtype=np.float64).reshape(-1, 2)
+        if len(local_indices) < 2 or len(ordered_points) < 3:
+            continue
+        stroke_key = canonical_cycle_sequence(face.get("stroke_indices", []))
+        area_key = round(float(face.get("abs_area", 0.0)), 3)
+        face_key = (stroke_key, area_key)
+        if face_key in seen_face_keys:
+            continue
+        seen_face_keys.add(face_key)
+        bounded_faces.append({
+            "component_local_indices": local_indices,
+            "topology_kind": "planar_bounded_face",
+            "topology": {
+                "from_planar_endpoint_node_graph": True,
+                "cycle_strokes": [int(x) for x in face.get("stroke_indices", [])],
+                "face_halfedge_ids": list(map(int, face.get("halfedge_ids", []))),
+                "signed_area": float(face.get("signed_area", 0.0)),
+                "abs_area": float(face.get("abs_area", 0.0)),
+                "endpoint_node_count": int(len(centers)),
+                "real_edge_count": int(len(real_edges)),
+                "connector_edge_count": int(len(connector_edges)),
+                "halfedge_count": int(len(halfedges)),
+                "raw_face_count": int(len(raw_faces)),
+                "bounded_face_count": int(len(area_faces) - (1 if outer_face_i is not None and len(area_faces) > 1 else 0)),
+                "unmatched_endpoint_nodes": list(graph.get("unmatched_endpoint_nodes", [])),
+                "from_planar_stroke_first_graph": True,
+                "from_planar_endpoint_node_graph": False,
+            },
+            "ordered_cycle": [
+                {
+                    "stroke_local_i": int(halfedges[int(he_id)]["stroke_local_i"]),
+                    "stroke_index": int(halfedges[int(he_id)]["stroke_index"]),
+                    "from_node": int(halfedges[int(he_id)]["from_node"]),
+                    "to_node": int(halfedges[int(he_id)]["to_node"]),
+                    "edge_kind": halfedges[int(he_id)].get("edge_kind", "stroke"),
+                }
+                for he_id in face.get("halfedge_ids", [])
+            ],
+            "ordered_loop_points": [[float(x), float(y)] for x, y in ordered_points.tolist()],
+            "connector_edges": json_safe_debug_value(face.get("connector_edges", [])),
+            "connector_total_gap": float(face.get("connector_total_gap", 0.0)),
+            "connector_max_gap": float(face.get("connector_max_gap", 0.0)),
+        })
+
+    bounded_faces.sort(key=lambda item: (
+        -float(item.get("topology", {}).get("abs_area", 0.0)),
+        item.get("topology", {}).get("cycle_strokes", []),
+    ))
+    if progress_callback is not None:
+        progress_callback(
+            "planar_face_extraction_finished",
+            **context,
+            bounded_face_count=int(len(bounded_faces)),
+            raw_face_count=int(len(raw_faces)),
+            area_face_count=int(len(area_faces)),
+            dropped_outer_face_index=None if outer_face_i is None else int(outer_face_i),
+            graph_summary={
+                "node_count": int(len(centers)),
+                "real_edge_count": int(len(real_edges)),
+                "connector_edge_count": int(len(connector_edges)),
+                "halfedge_count": int(len(halfedges)),
+                "unmatched_endpoint_count": int(len(graph.get("unmatched_endpoint_nodes", []))),
+                "strategy": graph.get("strategy", ""),
+            },
+            face_strokes=[item.get("topology", {}).get("cycle_strokes", []) for item in bounded_faces],
+        )
+    return bounded_faces
+
+
+def enumerate_endpoint_port_cycles(
+    strokes,
+    comp,
+    endpoint_tol=12.0,
+    max_loop_subset_size=14,
+    max_cycles=4096,
+    max_connectors_per_port=10,
+    max_dfs_steps=250000,
+    progress_callback=None,
+    progress_context=None,
+):
+    """
+    Enumerate closed boundary cycles without transitive endpoint-node merging.
+
+    Each real stroke endpoint is a graph port. Boundary walks alternate between a
+    stroke edge and a short virtual connector edge. This keeps nearby alternative
+    connections available, which is required for shared-edge or shared-node loops.
+    """
+    comp = sorted(set(int(i) for i in comp))
+    if len(comp) < 2:
+        return []
+    connectors, _port_points = build_endpoint_port_connectors(
+        strokes,
+        comp,
+        endpoint_tol=endpoint_tol,
+        max_connectors_per_port=max_connectors_per_port,
+    )
+    max_cycle_strokes = len(comp)
+    if max_loop_subset_size is not None and int(max_loop_subset_size) > 0:
+        # Treat the CLI value as a search guard, not as a hard cap that can hide
+        # long visible cap loops split into many short traced strokes.
+        max_cycle_strokes = min(len(comp), max(int(max_loop_subset_size), 32))
+
+    context = {} if progress_context is None else dict(progress_context)
+    if progress_callback is not None:
+        progress_callback(
+            "endpoint_cycle_dfs_started",
+            **context,
+            component_local_indices=list(comp),
+            component_stroke_indices=[int(strokes[int(i)]["index"]) for i in comp],
+            connector_port_count=int(len(connectors)),
+            connector_edge_count=int(sum(len(v) for v in connectors.values())),
+            max_cycle_strokes=int(max_cycle_strokes),
+            max_cycles=int(max_cycles),
+            max_dfs_steps=int(max_dfs_steps),
+        )
+
+    cycles = []
+    seen = set()
+    dfs_steps = 0
+    last_progress_cycle_count = 0
+
+    def add_cycle(path, closing_connector):
+        nonlocal last_progress_cycle_count
+        oriented = []
+        connector_edges = []
+        for idx, item in enumerate(path):
+            si, entry_endpoint, _incoming = item
+            next_si, next_entry, next_incoming = path[(idx + 1) % len(path)]
+            connector = closing_connector if idx == len(path) - 1 else next_incoming
+            next_entry_point = endpoint_port_point(strokes, next_si, next_entry)
+            oriented.append({
+                "stroke_local_i": int(si),
+                "stroke_index": int(strokes[int(si)]["index"]),
+                "entry_endpoint": int(entry_endpoint),
+                "exit_endpoint": int(1 - entry_endpoint),
+                "next_entry_point": [float(next_entry_point[0]), float(next_entry_point[1])],
+            })
+            from_port = (int(si), int(1 - entry_endpoint))
+            to_port = (int(next_si), int(next_entry))
+            connector_edges.append({
+                "from_stroke": int(strokes[from_port[0]]["index"]),
+                "from_endpoint": int(from_port[1]),
+                "to_stroke": int(strokes[to_port[0]]["index"]),
+                "to_endpoint": int(to_port[1]),
+                "distance": float(connector["distance"]),
+            })
+
+        stroke_seq = [item["stroke_index"] for item in oriented]
+        signature = canonical_cycle_sequence(stroke_seq)
+        if signature in seen:
+            return
+        seen.add(signature)
+        loop_points = ordered_loop_points_from_port_cycle(strokes, oriented)
+        if len(loop_points) < 3:
+            return
+        gaps = [float(item["distance"]) for item in connector_edges]
+        cycles.append({
+            "component_local_indices": [int(si) for si, _entry, _conn in path],
+            "topology_kind": "endpoint_port_cycle",
+            "topology": {
+                "from_endpoint_port_graph": True,
+                "cycle_strokes": stroke_seq,
+                "connector_total_gap": float(sum(gaps)),
+                "connector_max_gap": 0.0 if not gaps else float(max(gaps)),
+                "connector_count": int(len(connector_edges)),
+            },
+            "ordered_cycle": oriented,
+            "ordered_loop_points": [[float(x), float(y)] for x, y in loop_points.tolist()],
+            "connector_edges": connector_edges,
+            "connector_total_gap": float(sum(gaps)),
+            "connector_max_gap": 0.0 if not gaps else float(max(gaps)),
+        })
+        if progress_callback is not None and len(cycles) - last_progress_cycle_count >= 100:
+            last_progress_cycle_count = len(cycles)
+            progress_callback(
+                "endpoint_cycle_dfs_progress",
+                **context,
+                dfs_steps=int(dfs_steps),
+                cycles_found=int(len(cycles)),
+                seen_signatures=int(len(seen)),
+            )
+
+    def dfs(start_port, path, used_strokes):
+        nonlocal dfs_steps
+        if len(cycles) >= int(max_cycles) or dfs_steps >= int(max_dfs_steps):
+            return
+        dfs_steps += 1
+        if progress_callback is not None and dfs_steps % 5000 == 0:
+            progress_callback(
+                "endpoint_cycle_dfs_progress",
+                **context,
+                dfs_steps=int(dfs_steps),
+                cycles_found=int(len(cycles)),
+                seen_signatures=int(len(seen)),
+                current_start_port=list(start_port),
+                current_path_len=int(len(path)),
+            )
+        current_si, current_entry, _incoming = path[-1]
+        exit_port = (int(current_si), int(1 - current_entry))
+        for connector in connectors.get(exit_port, []):
+            next_port = connector["to"]
+            next_si, next_entry = int(next_port[0]), int(next_port[1])
+            if next_port == start_port:
+                if len(path) >= 2:
+                    add_cycle(path, connector)
+                continue
+            if next_si in used_strokes:
+                continue
+            if len(path) >= int(max_cycle_strokes):
+                continue
+            dfs(start_port, path + [(next_si, next_entry, connector)], used_strokes | {next_si})
+
+    for start_si in comp:
+        for start_entry in (0, 1):
+            start_port = (int(start_si), int(start_entry))
+            dfs(start_port, [(int(start_si), int(start_entry), None)], {int(start_si)})
+            if len(cycles) >= int(max_cycles) or dfs_steps >= int(max_dfs_steps):
+                break
+        if len(cycles) >= int(max_cycles) or dfs_steps >= int(max_dfs_steps):
+            break
+
+    cycles.sort(key=lambda item: (
+        -len(item.get("component_local_indices", [])),
+        float(item.get("connector_total_gap", 0.0)),
+        item.get("topology", {}).get("cycle_strokes", []),
+    ))
+    if progress_callback is not None:
+        progress_callback(
+            "endpoint_cycle_dfs_finished",
+            **context,
+            dfs_steps=int(dfs_steps),
+            cycles_found=int(len(cycles)),
+            seen_signatures=int(len(seen)),
+            hit_max_cycles=bool(len(cycles) >= int(max_cycles)),
+            hit_max_dfs_steps=bool(dfs_steps >= int(max_dfs_steps)),
+        )
+    return cycles
+
+
+def cap_loop_record_quality_key(record):
+    """Quality key for choosing one geometry when the stroke set is identical."""
+    cand = record.get("candidate", {}) or {}
+    stroke_set = record.get("stroke_set", set())
+    return (
+        float(cand.get("connector_total_gap", 0.0)),
+        float(cand.get("connector_max_gap", 0.0)),
+        -int(cand.get("enclosed_area", 0)),
+        -int(cand.get("area", 0)),
+        -len(stroke_set),
+        tuple(int(x) for x in sorted(stroke_set)),
+    )
+
+
+def deduplicate_cap_loop_records_by_stroke_set(records):
+    """Keep the best ordered loop for each exact stroke set."""
+    best_by_set = {}
+    for record in records:
+        stroke_set = frozenset(int(x) for x in record.get("stroke_set", set()))
+        if not stroke_set:
+            continue
+        record = dict(record)
+        record["stroke_set"] = stroke_set
+        key = tuple(sorted(stroke_set))
+        quality = cap_loop_record_quality_key(record)
+        old = best_by_set.get(key)
+        if old is None or quality < old[0]:
+            best_by_set[key] = (quality, record)
+    return [item[1] for item in best_by_set.values()]
+
+
+def cap_loop_cover_stats(selected_records, universe_strokes):
+    universe = set(int(x) for x in universe_strokes)
+    stroke_counts = {}
+    union = set()
+    total_gap = 0.0
+    max_gap = 0.0
+    total_area = 0
+    total_enclosed_area = 0
+    total_stroke_memberships = 0
+    interior_occupied = None
+    interior_overlap_area = 0
+
+    for record in selected_records:
+        stroke_set = set(int(x) for x in record.get("stroke_set", set()))
+        cand = record.get("candidate", {}) or {}
+        union |= stroke_set
+        total_stroke_memberships += len(stroke_set)
+        total_gap += float(cand.get("connector_total_gap", 0.0))
+        max_gap = max(max_gap, float(cand.get("connector_max_gap", 0.0)))
+        total_area += int(cand.get("area", 0))
+        total_enclosed_area += int(cand.get("enclosed_area", 0))
+        for sid in stroke_set:
+            stroke_counts[sid] = stroke_counts.get(sid, 0) + 1
+
+        interior_mask = cand.get("enclosed_mask", None)
+        if interior_mask is None:
+            interior_mask = record.get("cover_source_mask", None)
+        if interior_mask is not None:
+            current = np.asarray(interior_mask) > 0
+            if interior_occupied is None:
+                interior_occupied = np.zeros_like(current, dtype=bool)
+            if interior_occupied.shape == current.shape:
+                interior_overlap_area += int(np.count_nonzero(interior_occupied & current))
+                interior_occupied |= current
+
+    shared_strokes = sorted(int(sid) for sid, count in stroke_counts.items() if int(count) > 1)
+    repeated_count = int(max(0, total_stroke_memberships - len(union)))
+    missing = sorted(int(sid) for sid in universe - union)
+    extra = sorted(int(sid) for sid in union - universe)
+    return {
+        "union_strokes": sorted(int(sid) for sid in union),
+        "uses_all_component_strokes": bool(union == universe),
+        "missing_component_strokes": missing,
+        "extra_strokes": extra,
+        "shared_strokes": shared_strokes,
+        "shared_stroke_count": int(len(shared_strokes)),
+        "repeated_stroke_membership_count": repeated_count,
+        "total_connector_gap": float(total_gap),
+        "max_connector_gap": float(max_gap),
+        "total_area": int(total_area),
+        "total_enclosed_area": int(total_enclosed_area),
+        "interior_overlap_area": int(interior_overlap_area),
+        "loop_count": int(len(selected_records)),
+    }
+
+
+def cap_loop_cover_objective(selected_records, universe_strokes):
+    stats = cap_loop_cover_stats(selected_records, universe_strokes)
+    return (
+        int(stats["interior_overlap_area"]),
+        float(stats["total_connector_gap"]),
+        float(stats["max_connector_gap"]),
+        int(stats["loop_count"]),
+        -int(stats["shared_stroke_count"]),
+        int(stats["repeated_stroke_membership_count"]),
+        -int(stats["total_enclosed_area"]),
+        tuple(tuple(sorted(int(x) for x in record.get("stroke_set", set()))) for record in selected_records),
+    )
+
+
+def cap_loop_selection_objective_from_meta(meta):
+    if not meta or not meta.get("selected", False):
+        return (999999999, float("inf"), float("inf"), 999999, 0, 999999, 0, tuple())
+    objective = meta.get("cover_objective", None)
+    if objective is None:
+        return (999999999, float("inf"), float("inf"), 999999, 0, 999999, 0, tuple())
+    return tuple(objective)
+
+
+def select_full_component_loop_records(
+    records,
+    universe_strokes,
+    endpoint_tol=12.0,
+    max_cover_count=12,
+    max_records_per_stroke=64,
+    max_search_states=200000,
+):
+    """
+    Select only loops that explain the whole normalized component.
+
+    Preference order:
+      1. a single non-self-intersecting simple loop that uses every stroke;
+      2. otherwise, a small family of simple loops whose union uses every stroke.
+    """
+    universe = set(int(x) for x in universe_strokes)
+    meta = {
+        "selected": False,
+        "mode": "no_full_component_loop_cover",
+        "universe_strokes": sorted(universe),
+        "record_count_raw": int(len(records)),
+        "record_count_unique": 0,
+        "missing_component_strokes": sorted(universe),
+        "search_states": 0,
+        "search_truncated": False,
+        "max_cover_count": int(max_cover_count),
+        "max_records_per_stroke": int(max_records_per_stroke),
+        "max_search_states": int(max_search_states),
+    }
+    if not universe:
+        return [], meta
+
+    unique_records = deduplicate_cap_loop_records_by_stroke_set(records)
+    unique_records = [
+        record for record in unique_records
+        if set(record.get("stroke_set", set())).issubset(universe)
+    ]
+    unique_records.sort(key=cap_loop_record_quality_key)
+    meta["record_count_unique"] = int(len(unique_records))
+    if not unique_records:
+        return [], meta
+
+    full_records = [
+        record for record in unique_records
+        if set(record.get("stroke_set", set())) == universe
+    ]
+    if full_records:
+        selected = [min(full_records, key=cap_loop_record_quality_key)]
+        stats = cap_loop_cover_stats(selected, universe)
+        objective = cap_loop_cover_objective(selected, universe)
+        meta.update(stats)
+        meta.update({
+            "selected": True,
+            "mode": "single_simple_loop_uses_all_component_strokes",
+            "cover_objective": json_safe_debug_value(objective),
+        })
+        return selected, meta
+
+    stroke_to_records = {sid: [] for sid in universe}
+    for record in unique_records:
+        for sid in set(record.get("stroke_set", set())):
+            if int(sid) in stroke_to_records:
+                stroke_to_records[int(sid)].append(record)
+
+    missing = sorted(int(sid) for sid, items in stroke_to_records.items() if not items)
+    meta["missing_component_strokes"] = missing
+    if missing:
+        return [], meta
+
+    def choice_key_for_stroke(record):
+        cand = record.get("candidate", {}) or {}
+        stroke_set = set(record.get("stroke_set", set()))
+        return (
+            float(cand.get("connector_total_gap", 0.0)),
+            float(cand.get("connector_max_gap", 0.0)),
+            -len(stroke_set),
+            -int(cand.get("enclosed_area", 0)),
+            tuple(sorted(int(x) for x in stroke_set)),
+        )
+
+    for sid, items in stroke_to_records.items():
+        items.sort(key=choice_key_for_stroke)
+        if max_records_per_stroke is not None and int(max_records_per_stroke) > 0:
+            stroke_to_records[sid] = items[:int(max_records_per_stroke)]
+
+    record_ids = {id(record): i for i, record in enumerate(unique_records)}
+    best_selected = None
+    best_objective = None
+    search_states = 0
+    truncated = False
+    visited_states = set()
+    max_cover_count = max(1, int(max_cover_count))
+    max_search_states = max(1, int(max_search_states))
+
+    def dfs(selected, selected_ids, covered):
+        nonlocal best_selected, best_objective, search_states, truncated
+        if search_states >= max_search_states:
+            truncated = True
+            return
+        search_states += 1
+
+        if covered == universe:
+            objective = cap_loop_cover_objective(selected, universe)
+            if best_objective is None or objective < best_objective:
+                best_objective = objective
+                best_selected = list(selected)
+            return
+
+        if len(selected) >= max_cover_count:
+            return
+
+        if best_objective is not None:
+            partial_gap = sum(
+                float((record.get("candidate", {}) or {}).get("connector_total_gap", 0.0))
+                for record in selected
+            )
+            if partial_gap > float(best_objective[1]):
+                return
+
+        state_key = (
+            tuple(sorted(selected_ids)),
+            tuple(sorted(int(sid) for sid in covered)),
+        )
+        if state_key in visited_states:
+            return
+        visited_states.add(state_key)
+
+        uncovered = universe - covered
+        pivot = min(
+            uncovered,
+            key=lambda sid: sum(
+                1 for record in stroke_to_records.get(int(sid), [])
+                if record_ids[id(record)] not in selected_ids
+                and bool(set(record.get("stroke_set", set())) - covered)
+            ),
+        )
+
+        choices = []
+        for record in stroke_to_records.get(int(pivot), []):
+            rid = record_ids[id(record)]
+            if rid in selected_ids:
+                continue
+            stroke_set = set(record.get("stroke_set", set()))
+            new_strokes = stroke_set - covered
+            if not new_strokes:
+                continue
+            cand = record.get("candidate", {}) or {}
+            overlap = len(stroke_set & covered)
+            choices.append((
+                (
+                    float(cand.get("connector_total_gap", 0.0)),
+                    float(cand.get("connector_max_gap", 0.0)),
+                    -overlap,
+                    -len(new_strokes),
+                    -int(cand.get("enclosed_area", 0)),
+                    tuple(sorted(int(x) for x in stroke_set)),
+                ),
+                rid,
+                record,
+            ))
+        choices.sort(key=lambda item: item[0])
+
+        for _key, rid, record in choices:
+            stroke_set = set(record.get("stroke_set", set()))
+            dfs(
+                selected + [record],
+                selected_ids | {rid},
+                covered | stroke_set,
+            )
+            if truncated:
+                break
+
+    dfs([], set(), set())
+    meta["search_states"] = int(search_states)
+    meta["search_truncated"] = bool(truncated)
+
+    if best_selected is None:
+        covered = set()
+        for record in unique_records:
+            covered |= set(record.get("stroke_set", set()))
+        meta["missing_component_strokes"] = sorted(int(sid) for sid in universe - covered)
+        return [], meta
+
+    best_selected.sort(key=cap_loop_record_quality_key)
+    stats = cap_loop_cover_stats(best_selected, universe)
+    meta.update(stats)
+    meta.update({
+        "selected": True,
+        "mode": "shared_stroke_simple_loop_cover",
+        "cover_objective": json_safe_debug_value(best_objective),
+    })
+    return best_selected, meta
+
+
+def cap_loop_selection_needs_extended_search(meta, endpoint_tol=12.0):
+    if not meta or not meta.get("selected", False):
+        return True
+    if meta.get("mode") == "single_simple_loop_uses_all_component_strokes":
+        return False
+    if int(meta.get("interior_overlap_area", 0)) > 0:
+        return True
+    total_gap = float(meta.get("total_connector_gap", 0.0))
+    gap_limit = max(float(endpoint_tol or 0.0) * 3.0, 1.0)
+    return bool(meta.get("search_truncated", False)) or total_gap > gap_limit
 
 
 def is_connected_stroke_graph(comp, endpoint_nodes):
@@ -2897,6 +4534,7 @@ def extract_cap_loop_candidates_from_strokes(
     min_total_arc=0.0,
     thickness=2,
     max_loop_subset_size=14,
+    progress_callback=None,
 ):
     """
     Extract cap candidates from non-side connected components that are closed loops.
@@ -2912,21 +4550,60 @@ def extract_cap_loop_candidates_from_strokes(
         grown component by repeatedly removing strokes with degree-0 endpoints.
       - Any stroke whose two endpoints collapse into the same endpoint node is
         treated as a single-stroke self-loop and removed from cap membership.
-      - Accept a component as a cap only when every real stroke endpoint has
-        exactly one endpoint-proximity connection inside that component.
+      - Rebuild the existing endpoint-node graph for the normalized component.
+      - Traverse its planar half-edge embedding to get bounded faces directly.
+      - If those bounded faces cannot cover the normalized component without
+        interior overlap, this cluster contributes no cap candidate.
     """
-    _ = max_loop_subset_size  # Kept only for CLI/API compatibility.
     side_ids = {int(s["index"]) for s in side_inliers}
     non_side_infos = [s for s in infos if int(s["index"]) not in side_ids]
+    if progress_callback is not None:
+        progress_callback(
+            "cap_candidate_extraction_started",
+            side_indices=sorted(side_ids),
+            input_pool_count=int(len(infos)),
+            non_side_count=int(len(non_side_infos)),
+            endpoint_tol=float(endpoint_tol),
+            min_pixels=int(min_pixels),
+            min_enclosed_area=int(min_enclosed_area),
+            min_bbox_area=int(min_bbox_area),
+            min_total_arc=float(min_total_arc),
+            max_loop_subset_size=int(max_loop_subset_size),
+        )
     if not non_side_infos:
+        if progress_callback is not None:
+            progress_callback("cap_candidate_extraction_finished", candidate_count=0, reason="empty_non_side_pool")
         return []
 
     comps = connected_components_by_endpoint_proximity(non_side_infos, endpoint_tol=endpoint_tol)
+    if progress_callback is not None:
+        progress_callback(
+            "connected_components_built",
+            component_count=int(len(comps)),
+            components=[
+                {
+                    "component_index": int(i),
+                    "local_indices": [int(x) for x in comp],
+                    "stroke_indices": [int(non_side_infos[int(x)]["index"]) for x in comp],
+                    "stroke_count": int(len(comp)),
+                }
+                for i, comp in enumerate(comps)
+            ],
+        )
 
     candidates = []
     seen = set()
 
-    for comp in comps:
+    for component_i, comp in enumerate(comps):
+        comp = list(map(int, comp))
+        if progress_callback is not None:
+            progress_callback(
+                "component_started",
+                component_index=int(component_i),
+                local_indices=comp,
+                stroke_indices=[int(non_side_infos[i]["index"]) for i in comp],
+                stroke_count=int(len(comp)),
+            )
         normalized = normalize_cap_loop_component(
             non_side_infos,
             comp,
@@ -2934,39 +4611,246 @@ def extract_cap_loop_candidates_from_strokes(
         )
         final_comp = list(map(int, normalized["component_local_indices"]))
         if not final_comp:
+            if progress_callback is not None:
+                progress_callback(
+                    "component_skipped",
+                    component_index=int(component_i),
+                    reason="empty_after_normalization",
+                    trace=list(normalized.get("trace", [])),
+                )
             continue
         if not normalized.get("closed", False):
+            if progress_callback is not None:
+                progress_callback(
+                    "component_skipped",
+                    component_index=int(component_i),
+                    reason="not_closed_after_normalization",
+                    normalized_local_indices=final_comp,
+                    normalized_stroke_indices=[int(non_side_infos[i]["index"]) for i in final_comp],
+                    removed_open_branch_strokes=list(normalized.get("removed_open_branch_strokes", [])),
+                    removed_post_loop_self_strokes=list(normalized.get("removed_post_loop_self_strokes", [])),
+                    trace=list(normalized.get("trace", [])),
+                )
             continue
 
-        key = tuple(sorted(int(non_side_infos[i]["index"]) for i in final_comp))
-        if key in seen:
-            continue
-        seen.add(key)
-
-        cand = candidate_from_stroke_loop(image_shape, non_side_infos, final_comp, thickness=thickness)
-        if cand["area"] < min_pixels:
-            continue
-        if cand.get("enclosed_area", 0) < min_enclosed_area:
-            continue
-        if cand.get("bbox_area", 0) < min_bbox_area:
-            continue
-        if cand.get("total_arc", 0.0) < min_total_arc:
-            continue
         removed_branch = normalized.get("removed_open_branch_strokes", [])
         removed_self_loops = normalized.get("removed_post_loop_self_strokes", [])
-        if removed_self_loops and removed_branch:
-            cand["loop_detection"] = "component_iterative_prune_and_self_loop_removal"
-        elif removed_self_loops:
-            cand["loop_detection"] = "component_postloop_self_loop_removed"
-        else:
-            cand["loop_detection"] = "component_pruned_open_branches" if removed_branch else "component"
-        cand["component_local_indices"] = list(map(int, final_comp))
-        cand["component_normalization_trace"] = list(normalized.get("trace", []))
-        cand["pruned_branch_strokes"] = list(removed_branch)
-        cand["removed_post_loop_self_strokes"] = list(removed_self_loops)
-        candidates.append(cand)
+        component_strokes = [int(non_side_infos[i]["index"]) for i in final_comp]
+        component_universe = set(component_strokes)
+        if progress_callback is not None:
+            progress_callback(
+                "component_normalized_closed",
+                component_index=int(component_i),
+                normalized_local_indices=final_comp,
+                normalized_stroke_indices=component_strokes,
+                removed_open_branch_strokes=list(removed_branch),
+                removed_post_loop_self_strokes=list(removed_self_loops),
+                trace=list(normalized.get("trace", [])),
+            )
+
+        def build_cap_record(loop_info):
+            loop_comp = list(map(int, loop_info.get("component_local_indices", [])))
+            if not loop_comp:
+                return None
+
+            if loop_info.get("ordered_loop_points", None) is not None:
+                cand = candidate_from_ordered_loop(image_shape, non_side_infos, loop_info, thickness=thickness)
+                if cand is None:
+                    return None
+            else:
+                cand = candidate_from_stroke_loop(image_shape, non_side_infos, loop_comp, thickness=thickness)
+            if cand["area"] < min_pixels:
+                return None
+            if cand.get("enclosed_area", 0) < min_enclosed_area:
+                return None
+            if cand.get("bbox_area", 0) < min_bbox_area:
+                return None
+            if cand.get("total_arc", 0.0) < min_total_arc:
+                return None
+            _sweep_source, sweep_source_method = cap_ordered_filled_sweep_source_mask(
+                cand,
+                non_side_infos,
+                endpoint_tol=endpoint_tol,
+                thickness=thickness,
+            )
+            if _sweep_source is None:
+                return None
+            cand["sweep_source_mask_method"] = sweep_source_method
+
+            topology_kind = loop_info.get("topology_kind", "component")
+            if topology_kind == "decomposed_simple_loop":
+                cand["loop_detection"] = "component_shared_edge_decomposed_simple_loop"
+            elif topology_kind == "endpoint_port_cycle":
+                cand["loop_detection"] = "component_endpoint_port_cycle"
+            elif topology_kind == "planar_bounded_face":
+                cand["loop_detection"] = "component_planar_bounded_face"
+            elif removed_self_loops and removed_branch:
+                cand["loop_detection"] = "component_iterative_prune_and_self_loop_removal"
+            elif removed_self_loops:
+                cand["loop_detection"] = "component_postloop_self_loop_removed"
+            else:
+                cand["loop_detection"] = "component_pruned_open_branches" if removed_branch else "component"
+            if topology_kind == "multi_simple_loop_edge_disjoint":
+                cand["loop_detection"] = "component_multi_simple_loop_edge_disjoint"
+            elif topology_kind == "endpoint_proximity_closed_component":
+                cand["loop_detection"] = "component_endpoint_proximity_closed"
+            elif topology_kind == "planar_bounded_face":
+                cand["loop_detection"] = "component_planar_bounded_face"
+            elif topology_kind == "simple_loop" and cand["loop_detection"] == "component":
+                cand["loop_detection"] = "component_simple_loop"
+
+            cand["component_local_indices"] = list(map(int, loop_comp))
+            cand["source_normalized_component_local_indices"] = list(map(int, final_comp))
+            cand["source_normalized_component_strokes"] = list(component_strokes)
+            cand["component_normalization_trace"] = list(normalized.get("trace", []))
+            cand["component_topology"] = dict(loop_info.get("topology", {}))
+            cand["topology_kind"] = topology_kind
+            cand["pruned_branch_strokes"] = list(removed_branch)
+            cand["removed_post_loop_self_strokes"] = list(removed_self_loops)
+
+            stroke_set = frozenset(int(sid) for sid in cand.get("stroke_indices", []))
+            if not stroke_set:
+                return None
+            return {
+                "candidate": cand,
+                "loop_info": loop_info,
+                "stroke_set": stroke_set,
+                "cover_source_mask": _sweep_source,
+            }
+
+        def collect_planar_face_records():
+            loop_infos = extract_planar_face_loop_infos(
+                non_side_infos,
+                final_comp,
+                endpoint_tol=endpoint_tol,
+                progress_callback=progress_callback,
+                progress_context={
+                    "component_index": int(component_i),
+                    "component_strokes": component_strokes,
+                },
+            )
+            loop_infos.sort(key=lambda item: (
+                -float(item.get("topology", {}).get("abs_area", 0.0)),
+                item.get("topology", {}).get("cycle_strokes", []),
+            ))
+            records = []
+            processed_loop_count = 0
+            for loop_info in loop_infos:
+                processed_loop_count += 1
+                record = build_cap_record(loop_info)
+                if record is not None:
+                    records.append(record)
+                if progress_callback is not None and (
+                    processed_loop_count == 1
+                    or processed_loop_count == len(loop_infos)
+                    or processed_loop_count % 25 == 0
+                ):
+                    progress_callback(
+                        "planar_face_record_collection_progress",
+                        component_index=int(component_i),
+                        processed_loop_count=int(processed_loop_count),
+                        raw_loop_count=int(len(loop_infos)),
+                        valid_loop_record_count=int(len(records)),
+                        last_loop_strokes=loop_info.get("topology", {}).get("cycle_strokes", []),
+                        last_record_valid=bool(record is not None),
+                    )
+            if progress_callback is not None:
+                progress_callback(
+                    "planar_face_record_collection_finished",
+                    component_index=int(component_i),
+                    processed_loop_count=int(processed_loop_count),
+                    raw_loop_count=int(len(loop_infos)),
+                    valid_loop_record_count=int(len(records)),
+                )
+            return records, {
+                "source": "planar_bounded_faces",
+                "raw_loop_count": int(len(loop_infos)),
+                "processed_loop_count": int(processed_loop_count),
+                "valid_loop_record_count": int(len(records)),
+            }
+
+        planar_records, planar_search_meta = collect_planar_face_records()
+        selected_records, selection_meta = select_full_component_loop_records(
+            planar_records,
+            component_universe,
+            endpoint_tol=endpoint_tol,
+            max_cover_count=max(12, len(planar_records)),
+        )
+        selection_meta["search_rounds"] = [planar_search_meta]
+        if selected_records:
+            selection_meta["mode"] = "planar_bounded_face_cover"
+        if progress_callback is not None:
+            progress_callback(
+                "component_planar_loop_selection_finished",
+                component_index=int(component_i),
+                selected_record_count=int(len(selected_records)),
+                planar_record_count=int(len(planar_records)),
+                selection_meta=json_safe_debug_value(selection_meta),
+            )
+
+        if cap_loop_selection_needs_extended_search(selection_meta, endpoint_tol=endpoint_tol):
+            if progress_callback is not None:
+                progress_callback(
+                    "component_skipped",
+                    component_index=int(component_i),
+                    reason="planar_bounded_faces_do_not_form_required_cover",
+                    planar_record_count=int(len(planar_records)),
+                    selection_meta=json_safe_debug_value(selection_meta),
+                )
+            continue
+
+        for cover_index, record in enumerate(selected_records):
+            cand = record.get("candidate")
+            if cand is None:
+                continue
+            key = tuple(sorted(int(sid) for sid in cand.get("stroke_indices", [])))
+            if key in seen:
+                if progress_callback is not None:
+                    progress_callback(
+                        "candidate_skipped_duplicate",
+                        component_index=int(component_i),
+                        cover_index=int(cover_index),
+                        stroke_indices=list(key),
+                    )
+                continue
+            seen.add(key)
+
+            cover_stats = cap_loop_cover_stats(selected_records, component_universe)
+            selection_payload = dict(selection_meta)
+            selection_payload.update(cover_stats)
+            cand["component_loop_cover_selected"] = True
+            cand["component_loop_cover_index"] = int(cover_index)
+            cand["component_loop_cover_count"] = int(len(selected_records))
+            cand["component_loop_selection"] = json_safe_debug_value(selection_payload)
+            cand["component_loop_cover_union_strokes"] = sorted(component_universe)
+            cand["component_loop_cover_shared_strokes"] = list(cover_stats.get("shared_strokes", []))
+
+            mode = str(selection_meta.get("mode", ""))
+            if mode == "single_simple_loop_uses_all_component_strokes":
+                cand["loop_detection"] = "component_single_simple_loop_uses_all_strokes"
+            elif mode == "shared_stroke_simple_loop_cover":
+                cand["loop_detection"] = "component_shared_stroke_loop_cover_simple_loop"
+            elif mode == "planar_bounded_face_cover":
+                cand["loop_detection"] = "component_planar_bounded_face_cover"
+            elif mode == "single_full_component_fallback_loop":
+                cand["loop_detection"] = "component_single_full_component_fallback_loop"
+            candidates.append(cand)
+            if progress_callback is not None:
+                progress_callback(
+                    "candidate_added",
+                    component_index=int(component_i),
+                    cover_index=int(cover_index),
+                    candidate_count=int(len(candidates)),
+                    candidate=summarize_cap_candidate_for_status(cand),
+                )
 
     candidates.sort(key=lambda c: (c.get("enclosed_area", 0), c["score"]), reverse=True)
+    if progress_callback is not None:
+        progress_callback(
+            "cap_candidate_extraction_finished",
+            candidate_count=int(len(candidates)),
+            candidates=[summarize_cap_candidate_for_status(c) for c in candidates[:20]],
+        )
     return candidates
 
 
@@ -3027,6 +4911,20 @@ def init_cap_validation_details(entry, rank):
     details["best_cap_bbox_area"] = 0
     details["best_cap_center"] = None
     details["best_cap_total_arc"] = 0.0
+    details["best_cap_topology_kind"] = ""
+    details["best_cap_loop_detection"] = ""
+    details["best_cap_topology_cycle_count"] = 0
+    details["best_cap_topology_simple_cycle_count"] = 0
+    details["best_cap_topology_edge_disjoint_cover"] = False
+    details["best_cap_topology_edge_disjoint_cover_count"] = 0
+    details["best_cap_topology_self_loop_strokes"] = []
+    details["best_cap_component_loop_selection_mode"] = ""
+    details["best_cap_component_loop_cover_count"] = 0
+    details["best_cap_component_loop_cover_union_strokes"] = []
+    details["best_cap_component_loop_cover_shared_strokes"] = []
+    details["best_cap_component_loop_cover_total_gap"] = 0.0
+    details["best_cap_component_loop_cover_interior_overlap_area"] = 0
+    details["cap_candidate_evaluated_count"] = 0
     details["sweep_gate_enabled"] = False
     details["best_sweep_valid"] = False
     details["best_sweep_iou"] = 0.0
@@ -3038,9 +4936,22 @@ def init_cap_validation_details(entry, rank):
     details["best_sweep_mask_source"] = ""
     details["best_sweep_passed"] = False
     details["cap_found_but_sweep_rejected"] = False
+    details["side_cap_connect_enabled"] = False
+    details["side_cap_connect_tol"] = 0.0
+    details["side_cap_connect_passed"] = True
+    details["side_cap_connected_count"] = 0
+    details["side_cap_side_count"] = 0
+    details["side_cap_disconnected_strokes"] = []
+    details["side_cap_ignored_disconnected_strokes"] = []
+    details["side_cap_range_checked_count"] = 0
+    details["side_cap_range_method"] = ""
+    details["side_cap_connection_details"] = []
+    details["cap_found_but_side_cap_disconnected"] = False
     details["selection_passed"] = False
     details["invalid_no_cap"] = False
     details["selected_by_cap_validation"] = False
+    details["selected_by_iou_fallback"] = False
+    details["cap_validation_fallback_reason"] = ""
     details["skip_percluster_output"] = False
     details["subset_of_higher_rank_cap_cluster"] = False
     details["subset_parent_rank"] = None
@@ -3074,6 +4985,21 @@ def fill_best_cap_details(details, best_cap, candidate_count):
     details["best_cap_bbox_area"] = int(best_cap.get("bbox_area", 0))
     details["best_cap_center"] = center_tuple
     details["best_cap_total_arc"] = float(best_cap.get("total_arc", 0.0))
+    topology = best_cap.get("component_topology", {}) or {}
+    details["best_cap_topology_kind"] = str(best_cap.get("topology_kind", ""))
+    details["best_cap_loop_detection"] = str(best_cap.get("loop_detection", ""))
+    details["best_cap_topology_cycle_count"] = int(topology.get("cycle_count", 0))
+    details["best_cap_topology_simple_cycle_count"] = int(topology.get("simple_cycle_count", 0))
+    details["best_cap_topology_edge_disjoint_cover"] = bool(topology.get("edge_disjoint_cycle_cover_found", False))
+    details["best_cap_topology_edge_disjoint_cover_count"] = int(topology.get("edge_disjoint_cycle_cover_count", 0))
+    details["best_cap_topology_self_loop_strokes"] = list(topology.get("self_loop_strokes", []))
+    selection = best_cap.get("component_loop_selection", {}) or {}
+    details["best_cap_component_loop_selection_mode"] = str(selection.get("mode", ""))
+    details["best_cap_component_loop_cover_count"] = int(selection.get("loop_count", best_cap.get("component_loop_cover_count", 0)))
+    details["best_cap_component_loop_cover_union_strokes"] = list(selection.get("union_strokes", best_cap.get("component_loop_cover_union_strokes", [])))
+    details["best_cap_component_loop_cover_shared_strokes"] = list(selection.get("shared_strokes", best_cap.get("component_loop_cover_shared_strokes", [])))
+    details["best_cap_component_loop_cover_total_gap"] = float(selection.get("total_connector_gap", 0.0))
+    details["best_cap_component_loop_cover_interior_overlap_area"] = int(selection.get("interior_overlap_area", 0))
 
 
 def fill_best_cap_sweep_details(details, sweep_info, *, gate_enabled=False, stop_thresh=0.0):
@@ -3094,13 +5020,503 @@ def fill_best_cap_sweep_details(details, sweep_info, *, gate_enabled=False, stop
     details["best_sweep_passed"] = bool(passed)
 
 
+def min_distance_to_points(point, points):
+    if points is None or len(points) == 0:
+        return float("inf")
+    p = np.asarray(point, dtype=np.float64)
+    pts = np.asarray(points, dtype=np.float64)
+    d = pts - p[None, :]
+    return float(np.sqrt(np.min(np.sum(d * d, axis=1))))
+
+
+def cap_candidate_point_cloud(cap_candidate, infos):
+    if cap_candidate is None:
+        return np.empty((0, 2), dtype=np.float64)
+    cap_ids = {int(i) for i in cap_candidate.get("stroke_indices", [])}
+    chunks = []
+    for s in infos:
+        if int(s.get("index", -1)) in cap_ids:
+            chunks.append(np.asarray(s["points"], dtype=np.float64).reshape(-1, 2))
+    if chunks:
+        return np.vstack(chunks)
+
+    mask = cap_candidate.get("mask", None)
+    if mask is not None:
+        ys, xs = np.where(mask > 0)
+        if len(xs) > 0:
+            return np.column_stack([xs, ys]).astype(np.float64)
+    return np.empty((0, 2), dtype=np.float64)
+
+
+def odd_kernel_size_from_tolerance(tol, min_size=5, max_size=51):
+    size = int(round(float(tol or 0.0) * 2.0 + 1.0))
+    size = max(int(min_size), min(int(max_size), size))
+    if size % 2 == 0:
+        size += 1
+    return size
+
+
+def cap_candidate_stroke_infos(cap_candidate, infos):
+    if cap_candidate is None or infos is None:
+        return []
+    lookup = {int(s.get("index", -1)): s for s in infos}
+    return [
+        lookup[int(sid)]
+        for sid in cap_candidate.get("stroke_indices", [])
+        if int(sid) in lookup
+    ]
+
+
+def ordered_loop_polylines_from_strokes(
+    strokes,
+    endpoint_tol=12.0,
+    allow_open_endpoint_close=False,
+    validate_gap_lengths=True,
+):
+    """Order stroke graph components into closed or near-closed cap polylines."""
+    strokes = list(strokes or [])
+    if not strokes:
+        return []
+
+    endpoint_nodes, _centers = stroke_endpoint_node_ids(strokes, endpoint_tol=endpoint_tol)
+    node_to_edges = {}
+    for edge_idx, (a, b) in enumerate(endpoint_nodes):
+        if int(a) == int(b):
+            return []
+        node_to_edges.setdefault(int(a), []).append(edge_idx)
+        node_to_edges.setdefault(int(b), []).append(edge_idx)
+
+    loops = []
+    edge_components = connected_components_of_stroke_graph(len(strokes), endpoint_nodes)
+    for comp_edges in edge_components:
+        comp_edges = set(int(e) for e in comp_edges)
+        comp_nodes = set()
+        comp_node_degree = {}
+        for edge_idx in comp_edges:
+            a, b = endpoint_nodes[edge_idx]
+            a = int(a)
+            b = int(b)
+            comp_nodes.add(a)
+            comp_nodes.add(b)
+            comp_node_degree[a] = comp_node_degree.get(a, 0) + 1
+            comp_node_degree[b] = comp_node_degree.get(b, 0) + 1
+
+        degree_one_nodes = [n for n, d in comp_node_degree.items() if int(d) == 1]
+        if not all(int(d) in (1, 2) for d in comp_node_degree.values()):
+            return []
+        if len(degree_one_nodes) == 0:
+            start_edge = min(comp_edges)
+            current_node = int(endpoint_nodes[start_edge][0])
+            stop_node = current_node
+            closed_cycle = True
+        elif allow_open_endpoint_close and len(degree_one_nodes) == 2:
+            current_node = int(degree_one_nodes[0])
+            stop_node = int(degree_one_nodes[1])
+            closed_cycle = False
+        else:
+            return []
+
+        previous_edge = None
+        used_this_loop = set()
+        ordered_chunks = []
+
+        for _ in range(len(strokes) + 1):
+            candidate_edges = [
+                int(e)
+                for e in node_to_edges.get(current_node, [])
+                if int(e) in comp_edges and int(e) != previous_edge and int(e) not in used_this_loop
+            ]
+            if previous_edge is None and closed_cycle and start_edge in candidate_edges:
+                current_edge = int(start_edge)
+            elif candidate_edges:
+                current_edge = min(candidate_edges)
+            elif not closed_cycle and current_node == stop_node and used_this_loop == comp_edges:
+                break
+            elif closed_cycle and current_node == stop_node and used_this_loop == comp_edges:
+                break
+            else:
+                return []
+
+            a, b = endpoint_nodes[current_edge]
+            a = int(a)
+            b = int(b)
+            pts = np.asarray(strokes[current_edge]["points"], dtype=np.float64).reshape(-1, 2)
+            if current_node == a:
+                to_node = b
+                oriented = pts
+            elif current_node == b:
+                to_node = a
+                oriented = pts[::-1]
+            else:
+                return []
+
+            if ordered_chunks:
+                if validate_gap_lengths:
+                    gap = float(np.linalg.norm(ordered_chunks[-1][-1] - oriented[0]))
+                    if gap > float(endpoint_tol):
+                        return []
+                ordered_chunks.append(oriented)
+            else:
+                ordered_chunks.append(oriented)
+
+            used_this_loop.add(current_edge)
+            previous_edge = current_edge
+            current_node = to_node
+            if current_node == stop_node and used_this_loop == comp_edges:
+                break
+        else:
+            return []
+
+        if used_this_loop != comp_edges:
+            return []
+
+        if ordered_chunks:
+            if validate_gap_lengths:
+                closing_gap = float(np.linalg.norm(ordered_chunks[-1][-1] - ordered_chunks[0][0]))
+                if closing_gap > float(endpoint_tol):
+                    return []
+            polyline = np.vstack([chunk for chunk in ordered_chunks if len(chunk) > 0])
+            if len(polyline) >= 3:
+                loops.append(polyline)
+
+    return loops
+
+
+def ordered_loop_polylines_from_nearest_endpoint_matches(strokes, endpoint_tol=12.0):
+    """Order closed cap loop(s) using real nearest-endpoint connections."""
+    strokes = list(strokes or [])
+    if not strokes:
+        return []
+
+    matches = build_nearest_endpoint_matches(strokes, endpoint_tol=endpoint_tol)
+    endpoint_keys = [(si, ei) for si in range(len(strokes)) for ei in (0, 1)]
+    for key in endpoint_keys:
+        other = matches.get(key, None)
+        if other is None:
+            return []
+        if int(other[0]) == int(key[0]):
+            return []
+        if matches.get(other, None) != key:
+            return []
+
+    unused_strokes = set(range(len(strokes)))
+    loops = []
+    while unused_strokes:
+        start_si = min(unused_strokes)
+        start_key = (int(start_si), 0)
+        current_key = start_key
+        used_this_loop = set()
+        chunks = []
+
+        for _ in range(len(strokes) + 1):
+            si, ei = int(current_key[0]), int(current_key[1])
+            if si in used_this_loop:
+                return []
+            pts = np.asarray(strokes[si]["points"], dtype=np.float64).reshape(-1, 2)
+            oriented = pts if ei == 0 else pts[::-1]
+            chunks.append(oriented)
+            used_this_loop.add(si)
+
+            exit_key = (si, 1 - ei)
+            next_key = matches.get(exit_key, None)
+            if next_key is None:
+                return []
+            next_key = (int(next_key[0]), int(next_key[1]))
+            if next_key == start_key:
+                break
+            current_key = next_key
+        else:
+            return []
+
+        if not used_this_loop:
+            return []
+        unused_strokes -= used_this_loop
+        polyline = np.vstack([chunk for chunk in chunks if len(chunk) > 0])
+        if len(polyline) < 3:
+            return []
+        loops.append(polyline)
+
+    return loops
+
+
+def ordered_loop_polylines_from_cap_candidate(cap_candidate):
+    """Return precomputed loop points for endpoint-port cycle candidates."""
+    if cap_candidate is None:
+        return []
+    points = cap_candidate.get("ordered_loop_points", None)
+    if points is None:
+        return []
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if len(pts) < 3:
+        return []
+    return [pts]
+
+
+def cap_ordered_loop_range_mask(cap_candidate, infos, endpoint_tol=12.0):
+    """Fill the actual closed polygon(s) implied by cap stroke endpoint topology."""
+    stroke_mask = None if cap_candidate is None else cap_candidate.get("mask", None)
+    if stroke_mask is None:
+        return None, "no_cap_mask"
+
+    loops = ordered_loop_polylines_from_cap_candidate(cap_candidate)
+    method = "cap_endpoint_port_cycle_loop_mask"
+    if not loops:
+        cap_strokes = cap_candidate_stroke_infos(cap_candidate, infos)
+        loops = ordered_loop_polylines_from_nearest_endpoint_matches(
+            cap_strokes,
+            endpoint_tol=endpoint_tol,
+        )
+        method = "cap_ordered_nearest_endpoint_loop_mask"
+        if not loops:
+            loops = ordered_loop_polylines_from_strokes(
+                cap_strokes,
+                endpoint_tol=endpoint_tol,
+                allow_open_endpoint_close=False,
+                validate_gap_lengths=True,
+            )
+            method = "cap_ordered_stroke_loop_mask"
+    if not loops:
+        return None, "cap_ordered_loop_unavailable"
+
+    range_mask = np.zeros_like(stroke_mask, dtype=np.uint8)
+    for loop in loops:
+        pts = np.rint(loop).astype(np.int32).reshape(-1, 1, 2)
+        cv2.fillPoly(range_mask, [pts], 255, lineType=cv2.LINE_AA)
+    range_mask[stroke_mask > 0] = 255
+    if np.count_nonzero(range_mask > 0) == 0:
+        return None, "cap_ordered_loop_empty"
+    return range_mask, method
+
+
+def cap_ordered_filled_sweep_source_mask(cap_candidate, infos, endpoint_tol=12.0, thickness=2):
+    """Build the strict filled cap mask used as the source face for sweep IoU."""
+    stroke_mask = None if cap_candidate is None else cap_candidate.get("mask", None)
+    if stroke_mask is None or np.count_nonzero(stroke_mask > 0) == 0:
+        return None, "no_cap_mask"
+
+    loops = ordered_loop_polylines_from_cap_candidate(cap_candidate)
+    method = "cap_endpoint_port_cycle_bridged_filled_mask"
+    if not loops:
+        cap_strokes = cap_candidate_stroke_infos(cap_candidate, infos)
+        if len(cap_strokes) != len(set(int(i) for i in cap_candidate.get("stroke_indices", []))):
+            return None, "missing_cap_strokes"
+        loops = ordered_loop_polylines_from_nearest_endpoint_matches(
+            cap_strokes,
+            endpoint_tol=endpoint_tol,
+        )
+        method = "cap_ordered_nearest_endpoint_bridged_filled_mask"
+        if not loops:
+            loops = ordered_loop_polylines_from_strokes(
+                cap_strokes,
+                endpoint_tol=endpoint_tol,
+                allow_open_endpoint_close=False,
+                validate_gap_lengths=True,
+            )
+            method = "cap_ordered_endpoint_bridged_filled_mask"
+    if not loops:
+        return None, "closed_ordered_loop_unavailable"
+
+    boundary = np.zeros_like(stroke_mask, dtype=np.uint8)
+    filled = np.zeros_like(stroke_mask, dtype=np.uint8)
+    line_thickness = max(1, int(thickness))
+    for loop in loops:
+        pts = np.rint(loop).astype(np.int32).reshape(-1, 1, 2)
+        if len(pts) < 3:
+            return None, "closed_ordered_loop_too_short"
+        cv2.polylines(boundary, [pts], True, 255, line_thickness, cv2.LINE_AA)
+        cv2.fillPoly(filled, [pts], 255, lineType=cv2.LINE_AA)
+
+    source = (filled > 0).astype(np.uint8) * 255
+    source[boundary > 0] = 255
+    if np.count_nonzero(source > 0) == 0:
+        return None, "closed_filled_cap_empty"
+    if np.count_nonzero(source > 0) <= np.count_nonzero(boundary > 0):
+        return None, "closed_filled_cap_has_no_interior"
+    return source, method
+
+
+def cap_ordered_loop_range_mask_legacy(cap_candidate, infos, endpoint_tol=12.0):
+    """Legacy endpoint-node loop fill; kept for debugging comparisons."""
+    stroke_mask = None if cap_candidate is None else cap_candidate.get("mask", None)
+    if stroke_mask is None:
+        return None, "no_cap_mask"
+
+    cap_strokes = cap_candidate_stroke_infos(cap_candidate, infos)
+    loops = ordered_loop_polylines_from_strokes(
+        cap_strokes,
+        endpoint_tol=endpoint_tol,
+        allow_open_endpoint_close=False,
+        validate_gap_lengths=True,
+    )
+    if not loops:
+        return None, "cap_ordered_loop_unavailable"
+
+    range_mask = np.zeros_like(stroke_mask, dtype=np.uint8)
+    for loop in loops:
+        pts = np.rint(loop).astype(np.int32).reshape(-1, 1, 2)
+        cv2.fillPoly(range_mask, [pts], 255, lineType=cv2.LINE_AA)
+    range_mask[stroke_mask > 0] = 255
+    if np.count_nonzero(range_mask > 0) == 0:
+        return None, "cap_ordered_loop_empty"
+    return range_mask, "cap_ordered_stroke_loop_mask"
+
+
+def cap_candidate_enclosed_range_mask(cap_candidate, infos=None, connect_tol=0.0):
+    """Return the cap-stroke enclosed range mask used by side-cap connection gating."""
+    if cap_candidate is None:
+        return None, "no_cap"
+
+    ordered_mask, ordered_method = cap_ordered_loop_range_mask(
+        cap_candidate,
+        infos,
+        endpoint_tol=max(1.0, float(connect_tol or 0.0)),
+    )
+    if ordered_mask is not None:
+        return ordered_mask, ordered_method
+
+    stroke_mask = cap_candidate.get("mask", None)
+    enclosed_mask = cap_candidate.get("enclosed_mask", None)
+    if enclosed_mask is not None and np.count_nonzero(enclosed_mask > 0) > 0:
+        range_mask = (enclosed_mask > 0).astype(np.uint8) * 255
+        if stroke_mask is not None:
+            range_mask[stroke_mask > 0] = 255
+        method = f"cap_enclosed_mask_fallback_after_{ordered_method}"
+    elif stroke_mask is not None and np.count_nonzero(stroke_mask > 0) > 0:
+        close_kernel = odd_kernel_size_from_tolerance(connect_tol)
+        range_mask = fill_binary_mask(stroke_mask, close_kernel=close_kernel)
+        if np.count_nonzero(range_mask > 0) <= np.count_nonzero(stroke_mask > 0):
+            range_mask = (stroke_mask > 0).astype(np.uint8) * 255
+            method = f"cap_stroke_mask_fallback_after_{ordered_method}"
+        else:
+            method = f"cap_filled_stroke_mask_k{close_kernel}_fallback_after_{ordered_method}"
+    else:
+        return None, "no_cap_mask"
+
+    return range_mask, method
+
+
+def stroke_points_overlap_mask(stroke, mask):
+    """Return True when any sampled point of a stroke lies in a binary mask."""
+    if mask is None:
+        return True
+    pts = np.asarray(stroke.get("points", []), dtype=np.float64).reshape(-1, 2)
+    if len(pts) == 0:
+        pts = np.asarray(stroke_endpoint_points(stroke), dtype=np.float64).reshape(-1, 2)
+    h, w = mask.shape[:2]
+    xs = np.rint(pts[:, 0]).astype(np.int32)
+    ys = np.rint(pts[:, 1]).astype(np.int32)
+    valid = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+    if not np.any(valid):
+        return False
+    return bool(np.any(mask[ys[valid], xs[valid]] > 0))
+
+
+def side_cap_connection_info(entry, cap_candidate, infos, connect_tol=0.0):
+    """Check side-to-cap connection, enforcing only strokes inside the cap range."""
+    tol = 0.0 if connect_tol is None else float(connect_tol)
+    enabled = tol > 0.0
+    side_strokes = list(entry.get("strokes", []))
+    info = {
+        "enabled": bool(enabled),
+        "tol": float(tol),
+        "passed": True,
+        "side_count": int(len(side_strokes)),
+        "connected_count": int(len(side_strokes)),
+        "range_checked_count": int(len(side_strokes)),
+        "disconnected_strokes": [],
+        "ignored_disconnected_strokes": [],
+        "cap_range_method": "",
+        "details": [],
+    }
+    if not enabled:
+        return info
+
+    cap_points = cap_candidate_point_cloud(cap_candidate, infos)
+    if len(cap_points) == 0:
+        info["passed"] = False
+        info["connected_count"] = 0
+        info["range_checked_count"] = int(len(side_strokes))
+        info["disconnected_strokes"] = [int(s.get("index", -1)) for s in side_strokes]
+        return info
+
+    cap_range_mask, cap_range_method = cap_candidate_enclosed_range_mask(
+        cap_candidate,
+        infos=infos,
+        connect_tol=tol,
+    )
+    info["cap_range_method"] = cap_range_method
+
+    connected_count = 0
+    range_checked_count = 0
+    disconnected = []
+    ignored_disconnected = []
+    details = []
+    for s in side_strokes:
+        p0, p1 = stroke_endpoint_points(s)
+        d0 = min_distance_to_points(p0, cap_points)
+        d1 = min_distance_to_points(p1, cap_points)
+        min_d = min(d0, d1)
+        nearest_endpoint = "start" if d0 <= d1 else "end"
+        connected = bool(min_d <= tol)
+        in_cap_range = stroke_points_overlap_mask(s, cap_range_mask)
+        if connected:
+            connected_count += 1
+        elif in_cap_range:
+            range_checked_count += 1
+            disconnected.append(int(s.get("index", -1)))
+        else:
+            ignored_disconnected.append(int(s.get("index", -1)))
+        if connected and in_cap_range:
+            range_checked_count += 1
+        details.append({
+            "stroke": int(s.get("index", -1)),
+            "start_distance": float(d0),
+            "end_distance": float(d1),
+            "min_distance": float(min_d),
+            "nearest_endpoint": nearest_endpoint,
+            "connected": bool(connected),
+            "in_cap_range": bool(in_cap_range),
+            "ignored_disconnected": bool((not connected) and (not in_cap_range)),
+        })
+
+    info["passed"] = len(disconnected) == 0
+    info["connected_count"] = int(connected_count)
+    info["range_checked_count"] = int(range_checked_count)
+    info["disconnected_strokes"] = disconnected
+    info["ignored_disconnected_strokes"] = ignored_disconnected
+    info["details"] = details
+    return info
+
+
+def fill_side_cap_connection_details(details, connection_info):
+    if not connection_info:
+        return
+    details["side_cap_connect_enabled"] = bool(connection_info.get("enabled", False))
+    details["side_cap_connect_tol"] = float(connection_info.get("tol", 0.0))
+    details["side_cap_connect_passed"] = bool(connection_info.get("passed", True))
+    details["side_cap_connected_count"] = int(connection_info.get("connected_count", 0))
+    details["side_cap_side_count"] = int(connection_info.get("side_count", 0))
+    details["side_cap_range_checked_count"] = int(connection_info.get("range_checked_count", 0))
+    details["side_cap_disconnected_strokes"] = list(connection_info.get("disconnected_strokes", []))
+    details["side_cap_ignored_disconnected_strokes"] = list(connection_info.get("ignored_disconnected_strokes", []))
+    details["side_cap_range_method"] = connection_info.get("cap_range_method", "")
+    details["side_cap_connection_details"] = list(connection_info.get("details", []))
+
+
 def make_removed_subgroup_entry(parent_entry, removed_strokes, subgroup_strokes, cluster_id):
     """Create a direction-group subgroup by removing one or more strokes."""
     removed_strokes = list(removed_strokes)
     removal_depth = len(removed_strokes)
     removed_indices = [int(s["index"]) for s in removed_strokes]
     direction = mean_direction(subgroup_strokes)
-    score, details = score_side_cluster(subgroup_strokes, direction)
+    parent_details = parent_entry.get("details", {}) or {}
+    score, details = score_side_cluster(
+        subgroup_strokes,
+        direction,
+        same_loop_endpoint_tol=parent_details.get("score_same_loop_endpoint_tol", 12.0),
+        count_weight=parent_details.get("score_count_weight", 120.0),
+        same_loop_penalty_weight=parent_details.get("score_same_loop_penalty_weight", 220.0),
+    )
     details["n"] = len(subgroup_strokes)
     details["is_remove_one_subgroup"] = removal_depth == 1
     details["is_removed_subgroup"] = True
@@ -3137,9 +5553,28 @@ def compute_best_cap_for_side_entry(
     thickness=2,
     max_loop_subset_size=14,
     cap_pool_infos=None,
+    progress_debug_dir=None,
+    progress_rank=None,
 ):
     """Try one direction group as side strokes and return its largest-area cap."""
     pool_infos = infos if cap_pool_infos is None else cap_pool_infos
+
+    def progress(event, **payload):
+        if progress_debug_dir is None or progress_rank is None:
+            return
+        write_cluster_cap_search_step(progress_debug_dir, entry, progress_rank, event, **payload)
+
+    progress(
+        "compute_best_cap_for_side_entry_started",
+        cap_pool_count=int(len(pool_infos)),
+        side_indices=[int(s["index"]) for s in entry.get("strokes", [])],
+        endpoint_tol=float(endpoint_tol),
+        min_pixels=int(min_pixels),
+        min_enclosed_area=int(min_enclosed_area),
+        min_bbox_area=int(min_bbox_area),
+        min_total_arc=float(min_total_arc),
+        max_loop_subset_size=int(max_loop_subset_size),
+    )
     candidates = extract_cap_loop_candidates_from_strokes(
         image_shape,
         pool_infos,
@@ -3151,8 +5586,149 @@ def compute_best_cap_for_side_entry(
         min_total_arc=min_total_arc,
         thickness=thickness,
         max_loop_subset_size=max_loop_subset_size,
+        progress_callback=progress if progress_debug_dir is not None and progress_rank is not None else None,
     )
-    return largest_area_cap_candidate(candidates), candidates
+    best = largest_area_cap_candidate(candidates)
+    progress(
+        "compute_best_cap_for_side_entry_finished",
+        candidate_count=int(len(candidates)),
+        best_cap=summarize_cap_candidate_for_status(best),
+    )
+    return best, candidates
+
+
+def evaluate_cap_candidate_for_selection(
+    entry,
+    cap_candidate,
+    infos,
+    image_shape,
+    endpoint_tol,
+    thickness,
+    valid_input_enclosed_mask=None,
+    sweep_gate_enabled=False,
+    sweep_iou_stop_thresh=0.0,
+    copy_direction_angle_tol=None,
+    copy_iou_compare_percent=None,
+    side_cap_connect_tol=0.0,
+    progress_debug_dir=None,
+):
+    """Evaluate one cap candidate with sweep IoU and side-cap connection gates."""
+    sweep_info = None
+    if cap_candidate is not None and valid_input_enclosed_mask is not None:
+        sweep_info = compute_cap_sweep_similarity(
+            image_shape,
+            entry,
+            cap_candidate,
+            infos,
+            endpoint_tol,
+            thickness,
+            sketch_mask=valid_input_enclosed_mask,
+            copy_direction_angle_tol=copy_direction_angle_tol,
+            iou_compare_percent=copy_iou_compare_percent,
+        )
+
+    connection_info = side_cap_connection_info(
+        entry,
+        cap_candidate,
+        infos,
+        connect_tol=side_cap_connect_tol,
+    )
+
+    selection_passed = cap_candidate is not None
+    if sweep_gate_enabled:
+        selection_passed = (
+            sweep_info is not None
+            and bool(sweep_info.get("valid", False))
+            and float(sweep_info.get("iou", 0.0)) >= float(sweep_iou_stop_thresh)
+        )
+    if connection_info is not None:
+        selection_passed = bool(selection_passed) and bool(connection_info.get("passed", True))
+
+    return {
+        "cap_candidate": cap_candidate,
+        "sweep_info": sweep_info,
+        "connection_info": connection_info,
+        "selection_passed": bool(selection_passed),
+    }
+
+
+def choose_best_cap_candidate_for_selection(
+    entry,
+    candidates,
+    infos,
+    image_shape,
+    endpoint_tol,
+    thickness,
+    valid_input_enclosed_mask=None,
+    sweep_gate_enabled=False,
+    sweep_iou_stop_thresh=0.0,
+    copy_direction_angle_tol=None,
+    copy_iou_compare_percent=None,
+    side_cap_connect_tol=0.0,
+    progress_debug_dir=None,
+):
+    """Choose the best cap candidate after evaluating every candidate's IoU."""
+    if not candidates:
+        return None, None, None, False, []
+
+    evaluated = [
+        evaluate_cap_candidate_for_selection(
+            entry,
+            cap_candidate,
+            infos,
+            image_shape,
+            endpoint_tol,
+            thickness,
+            valid_input_enclosed_mask=valid_input_enclosed_mask,
+            sweep_gate_enabled=sweep_gate_enabled,
+            sweep_iou_stop_thresh=sweep_iou_stop_thresh,
+            copy_direction_angle_tol=copy_direction_angle_tol,
+            copy_iou_compare_percent=copy_iou_compare_percent,
+            side_cap_connect_tol=side_cap_connect_tol,
+        )
+        for cap_candidate in candidates
+    ]
+
+    def sort_key(item):
+        cap = item.get("cap_candidate") or {}
+        sweep_info = item.get("sweep_info") or {}
+        connection_info = item.get("connection_info") or {}
+        return (
+            1 if item.get("selection_passed", False) else 0,
+            1 if connection_info.get("passed", True) else 0,
+            float(sweep_info.get("iou", 0.0)),
+            int(cap.get("enclosed_area", 0)),
+            int(cap.get("area", 0)),
+            float(cap.get("score", 0.0)),
+        )
+
+    best = max(evaluated, key=sort_key)
+    return (
+        best.get("cap_candidate"),
+        best.get("sweep_info"),
+        best.get("connection_info"),
+        bool(best.get("selection_passed", False)),
+        evaluated,
+    )
+
+
+def is_iou_only_rejected_result(result, *, sweep_gate_enabled=False, sweep_iou_stop_thresh=0.0):
+    """Return True when an entry failed selection only because its IoU missed the threshold."""
+    if not sweep_gate_enabled or result is None:
+        return False
+    if result.get("selection_passed", False):
+        return False
+    if result.get("best_cap", None) is None:
+        return False
+
+    trace_item = result.get("trace_item", {}) or {}
+    if not bool(trace_item.get("best_sweep_valid", False)):
+        return False
+    if float(trace_item.get("best_sweep_iou", 0.0)) >= float(sweep_iou_stop_thresh):
+        return False
+    if not bool(trace_item.get("side_cap_passed", True)):
+        return False
+    return True
 
 
 def validate_side_clusters_by_cap_candidates(
@@ -3172,6 +5748,8 @@ def validate_side_clusters_by_cap_candidates(
     sweep_iou_stop_thresh=0.0,
     copy_direction_angle_tol=None,
     copy_iou_compare_percent=None,
+    side_cap_connect_tol=0.0,
+    progress_debug_dir=None,
 ):
     """
     Compute cap candidates for every direction group.
@@ -3209,30 +5787,41 @@ def validate_side_clusters_by_cap_candidates(
             thickness=thickness,
             max_loop_subset_size=max_loop_subset_size,
         )
-        best_cap = largest_area_cap_candidate(candidates)
-        sweep_info = None
-        selection_passed = best_cap is not None
-        if best_cap is not None and valid_input_enclosed_mask is not None:
-            pseudo_entry = {
-                "strokes": list(model.get("inliers", [])),
-                "indices": [int(s["index"]) for s in model.get("inliers", [])],
-                "direction": model.get("direction", None),
-            }
-            sweep_info = compute_cap_sweep_similarity(
-                image_shape,
+        pseudo_entry = {
+            "strokes": list(model.get("inliers", [])),
+            "indices": [int(s["index"]) for s in model.get("inliers", [])],
+            "direction": model.get("direction", None),
+        }
+        best_cap, sweep_info, connection_info, selection_passed, _cap_evaluations = choose_best_cap_candidate_for_selection(
+            pseudo_entry,
+            candidates,
+            infos,
+            image_shape,
+            endpoint_tol,
+            thickness,
+            valid_input_enclosed_mask=valid_input_enclosed_mask,
+            sweep_gate_enabled=sweep_gate_enabled,
+            sweep_iou_stop_thresh=sweep_iou_stop_thresh,
+            copy_direction_angle_tol=copy_direction_angle_tol,
+            copy_iou_compare_percent=copy_iou_compare_percent,
+            side_cap_connect_tol=side_cap_connect_tol,
+        )
+        if connection_info is None:
+            connection_info = side_cap_connection_info(
                 pseudo_entry,
                 best_cap,
                 infos,
-                endpoint_tol,
-                thickness,
-                sketch_mask=valid_input_enclosed_mask,
-                copy_direction_angle_tol=copy_direction_angle_tol,
-                iou_compare_percent=copy_iou_compare_percent,
+                connect_tol=side_cap_connect_tol,
             )
-            if sweep_gate_enabled:
-                selection_passed = bool(sweep_info.get("valid", False)) and float(sweep_info.get("iou", 0.0)) >= float(sweep_iou_stop_thresh)
 
         model["cap_sweep_gate_enabled"] = bool(sweep_gate_enabled)
+        model["side_cap_connect_enabled"] = bool(connection_info.get("enabled", False))
+        model["side_cap_connect_tol"] = float(connection_info.get("tol", 0.0))
+        model["side_cap_connect_passed"] = bool(connection_info.get("passed", True))
+        model["side_cap_disconnected_strokes"] = list(connection_info.get("disconnected_strokes", []))
+        model["side_cap_ignored_disconnected_strokes"] = list(connection_info.get("ignored_disconnected_strokes", []))
+        model["side_cap_range_checked_count"] = int(connection_info.get("range_checked_count", 0))
+        model["side_cap_range_method"] = connection_info.get("cap_range_method", "")
         model["cap_validated"] = bool(selection_passed)
         model["cap_validation_failed"] = not bool(selection_passed)
         if sweep_info is not None:
@@ -3247,6 +5836,28 @@ def validate_side_clusters_by_cap_candidates(
     cap_search_trace = []
     cap_search_rounds = []
     selected_result = None
+    selected_via_iou_fallback = False
+    iou_only_rejected_results = []
+
+    prepare_cluster_progress_debug_dir(progress_debug_dir)
+
+    def flush_round_progress(current_winner=None):
+        """Persist the current round state so long searches expose progress incrementally."""
+        if progress_debug_dir is None:
+            return
+        progress_model = dict(model)
+        progress_model["cluster_debug"] = expanded_cluster_debug
+        progress_model["cap_search_trace"] = cap_search_trace
+        progress_model["cap_search_rounds"] = cap_search_rounds
+        progress_model["cap_sweep_gate_enabled"] = bool(sweep_gate_enabled)
+        progress_model["side_cap_connect_enabled"] = bool(float(side_cap_connect_tol or 0.0) > 0.0)
+        progress_model["side_cap_connect_tol"] = float(side_cap_connect_tol or 0.0)
+        progress_model["selected_cluster_id"] = (
+            None
+            if current_winner is None
+            else int(current_winner["entry"].get("cluster_id", -1))
+        )
+        save_cluster_debug_outputs(progress_debug_dir, image_shape, progress_model)
 
     def evaluate_entry(entry, rank):
         details = init_cap_validation_details(entry, rank)
@@ -3254,55 +5865,166 @@ def validate_side_clusters_by_cap_candidates(
         n_strokes = int(details.get("n", len(entry.get("strokes", []))))
         best_cap = None
         sweep_info = None
-        if n_strokes < 2:
-            details["cap_validation_skipped"] = True
-            details["cap_validation_skip_reason"] = "n_lt_2"
-            details["cap_validation_selectable"] = False
-            trial_candidates = []
-        else:
-            details["cap_validation_checked"] = True
-            best_cap, trial_candidates = compute_best_cap_for_side_entry(
-                entry,
-                infos,
-                image_shape,
-                endpoint_tol=endpoint_tol,
-                min_pixels=min_pixels,
-                min_enclosed_area=min_enclosed_area,
-                min_bbox_area=min_bbox_area,
-                min_total_arc=min_total_arc,
-                thickness=thickness,
-                max_loop_subset_size=max_loop_subset_size,
-                cap_pool_infos=pool_infos,
-            )
-            fill_best_cap_details(details, best_cap, len(trial_candidates))
-            if best_cap is not None and valid_input_enclosed_mask is not None:
-                sweep_info = compute_cap_sweep_similarity(
-                    image_shape,
+        connection_info = None
+        trial_candidates = []
+        cap_evaluations = []
+        selection_passed = False
+        write_cluster_progress_status(
+            progress_debug_dir,
+            entry,
+            rank,
+            "started",
+            selection_passed=False,
+            sweep_gate_enabled=bool(sweep_gate_enabled),
+            sweep_iou_stop_thresh=float(sweep_iou_stop_thresh or 0.0),
+            side_cap_connect_tol=float(side_cap_connect_tol or 0.0),
+        )
+        save_cluster_progress_preview_outputs(
+            progress_debug_dir,
+            image_shape,
+            entry,
+            rank,
+            infos,
+            pool_infos,
+            endpoint_tol,
+        )
+        try:
+            if n_strokes < 2:
+                details["cap_validation_skipped"] = True
+                details["cap_validation_skip_reason"] = "n_lt_2"
+                details["cap_validation_selectable"] = False
+                write_cluster_progress_status(
+                    progress_debug_dir,
                     entry,
-                    best_cap,
+                    rank,
+                    "skipped_n_lt_2",
+                    selection_passed=False,
+                )
+            else:
+                details["cap_validation_checked"] = True
+                write_cluster_progress_status(
+                    progress_debug_dir,
+                    entry,
+                    rank,
+                    "searching_cap_candidates",
+                    selection_passed=False,
+                )
+                largest_cap_preview, trial_candidates = compute_best_cap_for_side_entry(
+                    entry,
                     infos,
+                    image_shape,
+                    endpoint_tol=endpoint_tol,
+                    min_pixels=min_pixels,
+                    min_enclosed_area=min_enclosed_area,
+                    min_bbox_area=min_bbox_area,
+                    min_total_arc=min_total_arc,
+                    thickness=thickness,
+                    max_loop_subset_size=max_loop_subset_size,
+                    cap_pool_infos=pool_infos,
+                    progress_debug_dir=progress_debug_dir,
+                    progress_rank=rank,
+                )
+                write_cluster_progress_status(
+                    progress_debug_dir,
+                    entry,
+                    rank,
+                    "evaluating_cap_candidates",
+                    selection_passed=False,
+                    cap_candidate_count=int(len(trial_candidates)),
+                    best_cap_preview=summarize_cap_candidate_for_status(largest_cap_preview),
+                )
+                best_cap, sweep_info, connection_info, selection_passed, cap_evaluations = choose_best_cap_candidate_for_selection(
+                    entry,
+                    trial_candidates,
+                    infos,
+                    image_shape,
                     endpoint_tol,
                     thickness,
-                    sketch_mask=valid_input_enclosed_mask,
+                    valid_input_enclosed_mask=valid_input_enclosed_mask,
+                    sweep_gate_enabled=sweep_gate_enabled,
+                    sweep_iou_stop_thresh=sweep_iou_stop_thresh,
                     copy_direction_angle_tol=copy_direction_angle_tol,
-                    iou_compare_percent=copy_iou_compare_percent,
+                    copy_iou_compare_percent=copy_iou_compare_percent,
+                    side_cap_connect_tol=side_cap_connect_tol,
                 )
+                details["cap_candidate_evaluated_count"] = int(len(cap_evaluations))
+                fill_best_cap_details(details, best_cap, len(trial_candidates))
                 fill_best_cap_sweep_details(
                     details,
                     sweep_info,
                     gate_enabled=sweep_gate_enabled,
                     stop_thresh=sweep_iou_stop_thresh,
                 )
+                if connection_info is not None:
+                    fill_side_cap_connection_details(details, connection_info)
 
-        selection_passed = False
-        if best_cap is not None:
-            if sweep_gate_enabled:
-                selection_passed = bool(details.get("best_sweep_passed", False))
-                details["cap_found_but_sweep_rejected"] = not bool(selection_passed)
-            else:
-                selection_passed = True
-        details["selection_passed"] = bool(selection_passed)
-        details["cap_validation_selectable"] = bool(selection_passed)
+            if best_cap is not None:
+                if sweep_gate_enabled:
+                    details["cap_found_but_sweep_rejected"] = not bool(details.get("best_sweep_passed", False))
+                if connection_info is not None:
+                    details["cap_found_but_side_cap_disconnected"] = not bool(connection_info.get("passed", True))
+            details["selection_passed"] = bool(selection_passed)
+            details["cap_validation_selectable"] = bool(selection_passed)
+
+            write_cluster_progress_status(
+                progress_debug_dir,
+                entry,
+                rank,
+                "writing_debug_outputs",
+                selection_passed=bool(selection_passed),
+                cap_candidate_count=int(len(trial_candidates)),
+                cap_candidate_evaluated_count=int(len(cap_evaluations)),
+                best_cap=summarize_cap_candidate_for_status(best_cap),
+                best_sweep_iou=0.0 if sweep_info is None else float(sweep_info.get("iou", 0.0)),
+                best_sweep_valid=False if sweep_info is None else bool(sweep_info.get("valid", False)),
+                side_cap_passed=True if connection_info is None else bool(connection_info.get("passed", True)),
+            )
+
+            save_single_cluster_candidate_debug_output(
+                progress_debug_dir,
+                image_shape,
+                entry,
+                rank,
+                infos,
+                pool_infos,
+                best_cap,
+                cap_evaluations,
+                endpoint_tol,
+                thickness,
+                valid_input_enclosed_mask=valid_input_enclosed_mask,
+                sweep_gate_enabled=sweep_gate_enabled,
+                sweep_iou_stop_thresh=sweep_iou_stop_thresh,
+                copy_direction_angle_tol=copy_direction_angle_tol,
+                copy_iou_compare_percent=copy_iou_compare_percent,
+            )
+
+            write_cluster_progress_status(
+                progress_debug_dir,
+                entry,
+                rank,
+                "completed",
+                selection_passed=bool(selection_passed),
+                cap_candidate_count=int(len(trial_candidates)),
+                cap_candidate_evaluated_count=int(len(cap_evaluations)),
+                best_cap=summarize_cap_candidate_for_status(best_cap),
+                best_sweep_iou=0.0 if sweep_info is None else float(sweep_info.get("iou", 0.0)),
+                best_sweep_valid=False if sweep_info is None else bool(sweep_info.get("valid", False)),
+                side_cap_passed=True if connection_info is None else bool(connection_info.get("passed", True)),
+                side_cap_connected_count=0 if connection_info is None else int(connection_info.get("connected_count", 0)),
+                side_cap_side_count=0 if connection_info is None else int(connection_info.get("side_count", 0)),
+            )
+        except Exception as exc:
+            write_cluster_progress_status(
+                progress_debug_dir,
+                entry,
+                rank,
+                "failed",
+                selection_passed=False,
+                error=str(exc),
+                cap_candidate_count=int(len(trial_candidates)),
+                cap_candidate_evaluated_count=int(len(cap_evaluations)),
+            )
+            raise
 
         trace_item = {
             "order": int(len(cap_search_trace)),
@@ -3319,12 +6041,19 @@ def validate_side_clusters_by_cap_candidates(
             "skip_reason": details.get("cap_validation_skip_reason", ""),
             "cap_found": best_cap is not None,
             "cap_candidate_count": int(details.get("cap_candidate_count", 0)),
+            "cap_candidate_evaluated_count": int(details.get("cap_candidate_evaluated_count", 0)),
             "best_cap_area": int(details.get("best_cap_area", 0)),
             "best_cap_enclosed_area": int(details.get("best_cap_enclosed_area", 0)),
             "best_cap_bbox_area": int(details.get("best_cap_bbox_area", 0)),
             "best_cap_total_arc": float(details.get("best_cap_total_arc", 0.0)),
             "best_cap_score": float(details.get("best_cap_score", 0.0)),
             "best_cap_strokes": list(details.get("best_cap_strokes", [])),
+            "best_cap_topology_kind": details.get("best_cap_topology_kind", ""),
+            "best_cap_loop_detection": details.get("best_cap_loop_detection", ""),
+            "best_cap_topology_cycle_count": int(details.get("best_cap_topology_cycle_count", 0)),
+            "best_cap_topology_simple_cycle_count": int(details.get("best_cap_topology_simple_cycle_count", 0)),
+            "best_cap_topology_edge_disjoint_cover": bool(details.get("best_cap_topology_edge_disjoint_cover", False)),
+            "best_cap_topology_edge_disjoint_cover_count": int(details.get("best_cap_topology_edge_disjoint_cover_count", 0)),
             "best_sweep_valid": bool(details.get("best_sweep_valid", False)),
             "best_sweep_iou": float(details.get("best_sweep_iou", 0.0)),
             "best_sweep_intersection": int(details.get("best_sweep_intersection", 0)),
@@ -3332,6 +6061,18 @@ def validate_side_clusters_by_cap_candidates(
             "best_sweep_area": int(details.get("best_sweep_area", 0)),
             "best_sweep_copy_side_stroke": details.get("best_sweep_copy_side_stroke", None),
             "best_sweep_copy_reason": details.get("best_sweep_copy_reason", ""),
+            "best_sweep_mask_source": details.get("best_sweep_mask_source", ""),
+            "side_cap_connect_enabled": bool(details.get("side_cap_connect_enabled", False)),
+            "side_cap_connect_tol": float(details.get("side_cap_connect_tol", 0.0)),
+            "side_cap_connect_passed": bool(details.get("side_cap_connect_passed", True)),
+            "side_cap_connected_count": int(details.get("side_cap_connected_count", 0)),
+            "side_cap_side_count": int(details.get("side_cap_side_count", 0)),
+            "side_cap_range_checked_count": int(details.get("side_cap_range_checked_count", 0)),
+            "side_cap_disconnected_strokes": list(details.get("side_cap_disconnected_strokes", [])),
+            "side_cap_ignored_disconnected_strokes": list(details.get("side_cap_ignored_disconnected_strokes", [])),
+            "side_cap_range_method": details.get("side_cap_range_method", ""),
+            "side_cap_connection_details": list(details.get("side_cap_connection_details", [])),
+            "cap_found_but_side_cap_disconnected": bool(details.get("cap_found_but_side_cap_disconnected", False)),
             "cap_found_but_sweep_rejected": bool(details.get("cap_found_but_sweep_rejected", False)),
             "selection_passed": bool(selection_passed),
         }
@@ -3383,6 +6124,35 @@ def validate_side_clusters_by_cap_candidates(
                 "removal_depth": int(entry.get("removal_depth", 0)),
             })
 
+    def append_fallback_success_result(result):
+        if result is None:
+            return
+        entry = result["entry"]
+        cluster_id = int(entry.get("cluster_id", -1))
+        for item in successful_cap_clusters:
+            if int(item.get("cluster_id", -1)) == cluster_id:
+                return
+        removed_stroke_indices = list(entry.get("removed_stroke_indices", []))
+        side_set = cluster_entry_index_set(entry)
+        successful_cap_clusters.append({
+            "rank": int(result.get("rank", -1)),
+            "cluster_id": int(entry.get("cluster_id", -1)),
+            "side_set": set(side_set),
+            "parent_cluster_id": entry.get("parent_cluster_id", None),
+            "removed_stroke_index": removed_stroke_indices[0] if len(removed_stroke_indices) == 1 else None,
+            "removed_stroke_indices": removed_stroke_indices,
+            "removal_depth": int(entry.get("removal_depth", 0)),
+        })
+
+    def record_iou_only_rejected_results(round_results):
+        for result in round_results:
+            if is_iou_only_rejected_result(
+                result,
+                sweep_gate_enabled=sweep_gate_enabled,
+                sweep_iou_stop_thresh=sweep_iou_stop_thresh,
+            ):
+                iou_only_rejected_results.append(result)
+
     def summarize_round(removal_depth, round_results, winner):
         cap_results = [r for r in round_results if r.get("best_cap") is not None]
         best_iou_result = None
@@ -3404,9 +6174,7 @@ def validate_side_clusters_by_cap_candidates(
         remaining_after_removal = len(parent_entry.get("strokes", [])) - int(removal_depth)
         if remaining_after_removal <= 1:
             return False
-        if sweep_gate_enabled:
-            return not any(r.get("selection_passed", False) for r in parent_round_results)
-        return not any(r.get("best_cap") is not None for r in parent_round_results)
+        return not any(r.get("selection_passed", False) for r in parent_round_results)
 
     original_round_results = []
     for entry in original_cluster_debug:
@@ -3415,8 +6183,10 @@ def validate_side_clusters_by_cap_candidates(
         original_round_results.append(evaluate_entry(entry, rank))
 
     record_successful_results(original_round_results)
+    record_iou_only_rejected_results(original_round_results)
     selected_result = choose_round_winner(original_round_results)
     summarize_round(0, original_round_results, selected_result)
+    flush_round_progress(selected_result)
 
     failed_original_groups = []
     if selected_result is None:
@@ -3424,9 +6194,7 @@ def validate_side_clusters_by_cap_candidates(
             entry = result["entry"]
             if len(entry.get("strokes", [])) <= 1:
                 continue
-            if sweep_gate_enabled:
-                failed_original_groups.append(entry)
-            elif result.get("best_cap") is None:
+            if not result.get("selection_passed", False):
                 failed_original_groups.append(entry)
 
     import itertools
@@ -3474,17 +6242,27 @@ def validate_side_clusters_by_cap_candidates(
                 still_failed.append(parent_entry)
 
         record_successful_results(round_results)
+        record_iou_only_rejected_results(round_results)
         selected_result = choose_round_winner(round_results)
         summarize_round(removal_depth, round_results, selected_result)
+        flush_round_progress(selected_result)
         if selected_result is not None:
             break
 
         failed_original_groups = still_failed
 
+    if selected_result is None and iou_only_rejected_results:
+        selected_result = max(iou_only_rejected_results, key=winner_sort_key)
+        selected_via_iou_fallback = True
+        append_fallback_success_result(selected_result)
+
     model["cluster_debug"] = expanded_cluster_debug
     model["cap_search_trace"] = cap_search_trace
     model["cap_search_rounds"] = cap_search_rounds
     model["cap_sweep_gate_enabled"] = bool(sweep_gate_enabled)
+    model["side_cap_connect_enabled"] = bool(float(side_cap_connect_tol or 0.0) > 0.0)
+    model["side_cap_connect_tol"] = float(side_cap_connect_tol or 0.0)
+    model["cap_validation_used_iou_fallback"] = bool(selected_via_iou_fallback)
     model["successful_cap_clusters"] = [
         {
             "rank": int(x["rank"]),
@@ -3501,6 +6279,7 @@ def validate_side_clusters_by_cap_candidates(
     if selected_result is None:
         model["cap_validated"] = False
         model["cap_validation_failed"] = True
+        model["cap_validation_used_iou_fallback"] = False
         if sweep_gate_enabled:
             model["cap_validation_message"] = (
                 "No search round produced a cap whose swept extrusion occupancy IoU passed the input enclosed-mask threshold."
@@ -3512,6 +6291,9 @@ def validate_side_clusters_by_cap_candidates(
 
     selected_entry = selected_result["entry"]
     selected_entry["details"]["selected_by_cap_validation"] = True
+    selected_entry["details"]["selected_by_iou_fallback"] = bool(selected_via_iou_fallback)
+    if selected_via_iou_fallback:
+        selected_entry["details"]["cap_validation_fallback_reason"] = "highest_iou_rejected_only_by_sweep_threshold"
     selected_candidates = [selected_result["best_cap"]]
 
     validated_model = make_trial_model_from_cluster_entry(
@@ -3524,8 +6306,8 @@ def validate_side_clusters_by_cap_candidates(
     if sweep_gate_enabled:
         validated_model["cap_validation_message"] = (
             "Computed every subgroup in each removal-depth round and stopped only when a round produced at least one cap "
-            "whose swept extrusion occupancy IoU passed the input enclosed-mask threshold. The selected entry is the highest-IoU "
-            "candidate from that stopping round."
+            "whose swept extrusion occupancy IoU passed the input enclosed-mask threshold and whose side strokes passed "
+            "the side-cap connection gate. The selected entry is the highest-IoU candidate from that stopping round."
         )
     else:
         validated_model["cap_validation_message"] = (
@@ -3536,6 +6318,27 @@ def validate_side_clusters_by_cap_candidates(
     validated_model["cap_search_trace"] = cap_search_trace
     validated_model["cap_search_rounds"] = cap_search_rounds
     validated_model["cap_sweep_gate_enabled"] = bool(sweep_gate_enabled)
+    validated_model["side_cap_connect_enabled"] = bool(float(side_cap_connect_tol or 0.0) > 0.0)
+    validated_model["side_cap_connect_tol"] = float(side_cap_connect_tol or 0.0)
+    validated_model["cap_validation_used_iou_fallback"] = bool(selected_via_iou_fallback)
+    validated_model["side_cap_connect_passed"] = bool(
+        selected_entry.get("details", {}).get("side_cap_connect_passed", True)
+    )
+    validated_model["side_cap_disconnected_strokes"] = list(
+        selected_entry.get("details", {}).get("side_cap_disconnected_strokes", [])
+    )
+    validated_model["side_cap_ignored_disconnected_strokes"] = list(
+        selected_entry.get("details", {}).get("side_cap_ignored_disconnected_strokes", [])
+    )
+    validated_model["side_cap_range_checked_count"] = int(
+        selected_entry.get("details", {}).get("side_cap_range_checked_count", 0)
+    )
+    validated_model["side_cap_range_method"] = selected_entry.get("details", {}).get("side_cap_range_method", "")
+    if selected_via_iou_fallback:
+        validated_model["cap_validation_message"] = (
+            "No cap passed the sweep IoU threshold, so the highest-IoU candidate whose only rejection reason was that IoU threshold "
+            "was selected as a fallback."
+        )
     return validated_model, selected_candidates
 
 # ============================================================
@@ -3680,8 +6483,8 @@ def rasterize_connection_line(shape, p0, p1, thickness=1):
         tuple(map(int, p0)),
         tuple(map(int, p1)),
         255,
-        int(max(1, thickness)),
-        cv2.LINE_AA,
+        1,
+        cv2.LINE_8,
     )
     return mask
 
@@ -3903,8 +6706,8 @@ def cleanup_skeleton_endpoints(
             p0,
             p1,
             255,
-            int(max(1, connect_thickness)),
-            cv2.LINE_AA,
+            1,
+            cv2.LINE_8,
         )
         connections.append({
             "connection_index": int(len(connections)),
@@ -4513,6 +7316,197 @@ def draw_line_stroke_candidates_image(shape, line_strokes, thickness=3):
     return out
 
 
+def draw_label_segments(out, x, y, segments, font_scale=0.36):
+    cursor_x = int(x)
+    base_y = int(y)
+    for text, color, text_thickness in segments:
+        text_thickness = int(text_thickness)
+        # OpenCV thickness=2 gets chunky on small debug labels; use a lighter
+        # two-pass horizontal emphasis for failed threshold values.
+        if text_thickness >= 2:
+            cv2.putText(
+                out,
+                text,
+                (cursor_x, base_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                out,
+                text,
+                (cursor_x + 1, base_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+            size, _ = cv2.getTextSize(
+                text,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                1,
+            )
+            cursor_x += size[0] + 3
+            continue
+        cv2.putText(
+            out,
+            text,
+            (cursor_x, base_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            color,
+            text_thickness,
+            cv2.LINE_AA,
+        )
+        size, _ = cv2.getTextSize(
+            text,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            text_thickness,
+        )
+        cursor_x += size[0] + 2
+
+
+def side_prefilter_result_for_draw(s, args):
+    if args is None:
+        return {
+            "failed_checks": {
+                "arc": False,
+                "chord": False,
+                "straightness": False,
+                "p90_pca_line_error": False,
+                "pca_rms_error": False,
+                "chord_deviation_ratio": False,
+            }
+        }
+    return side_direction_group_filter_result(
+        s,
+        min_length=args.min_stroke_length,
+        min_straightness=args.side_straightness,
+        min_chord=args.side_min_chord_px,
+        line_p90_error_px=args.side_line_p90_error_px,
+        line_p90_error_ratio=args.side_line_p90_error_ratio,
+        line_rms_error_px=args.side_line_rms_error_px,
+        line_rms_error_ratio=args.side_line_rms_error_ratio,
+        chord_dev_ratio_max=args.side_chord_dev_ratio_max,
+    )
+
+
+def draw_side_prefilter_candidates_image(shape, infos, side_candidates, args=None, thickness=4):
+    """Draw strokes that pass the pre-cluster side-line filters."""
+    h, w = shape[:2]
+    out = np.full((h, w, 3), 255, dtype=np.uint8)
+    side_ids = {int(s["index"]) for s in side_candidates}
+    red = (0, 0, 220)
+    black = (0, 0, 0)
+
+    for s in infos:
+        if int(s["index"]) in side_ids:
+            continue
+        pts = s["points"].reshape(-1, 1, 2).astype(np.int32)
+        cv2.polylines(out, [pts], False, (205, 205, 205), 1, cv2.LINE_AA)
+        result = side_prefilter_result_for_draw(s, args)
+        failed = result.get("failed_checks", {})
+        if failed.get("arc") or failed.get("chord"):
+            continue
+        c = s["center"]
+        x = int(c[0]) + 4
+        y = int(c[1]) - 4
+        draw_label_segments(
+            out,
+            x,
+            y,
+            [
+                (f"{int(s['index'])} ", red, 1),
+                ("s=", red, 1),
+                (f"{float(s.get('straightness', 0.0)):.2f} ", red, 2 if failed.get("straightness") else 1),
+                ("p90=", red, 1),
+                (f"{float(s.get('p90_pca_line_error', 0.0)):.1f}", red, 2 if failed.get("p90_pca_line_error") else 1),
+            ],
+            font_scale=0.34,
+        )
+        draw_label_segments(
+            out,
+            x,
+            y + 14,
+            [
+                ("rms=", red, 1),
+                (f"{float(s.get('pca_rms_error', 0.0)):.1f} ", red, 2 if failed.get("pca_rms_error") else 1),
+                ("d/c=", red, 1),
+                (f"{float(s.get('chord_deviation_ratio', 0.0)):.3f}", red, 2 if failed.get("chord_deviation_ratio") else 1),
+            ],
+            font_scale=0.34,
+        )
+
+    for i, s in enumerate(side_candidates):
+        pts = s["points"].reshape(-1, 1, 2).astype(np.int32)
+        color = random_color(i)
+        cv2.polylines(out, [pts], False, color, thickness, cv2.LINE_AA)
+        c = s["center"]
+        label1 = f"{int(s['index'])} s={float(s.get('straightness', 0.0)):.2f}"
+        label2 = (
+            f"p90={float(s.get('p90_pca_line_error', 0.0)):.1f} "
+            f"rms={float(s.get('pca_rms_error', 0.0)):.1f} "
+            f"d/c={float(s.get('chord_deviation_ratio', 0.0)):.3f}"
+        )
+        cv2.putText(
+            out,
+            label1,
+            (int(c[0]) + 4, int(c[1]) - 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.43,
+            black,
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            out,
+            label2,
+            (int(c[0]) + 4, int(c[1]) + 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.36,
+            black,
+            1,
+            cv2.LINE_AA,
+        )
+
+    cv2.putText(
+        out,
+        "Side prefilter candidates entering PCA direction clustering",
+        (15, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (0, 0, 0),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        out,
+        "gray = rejected before clustering, colored = possible side strokes",
+        (15, 50),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        red,
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        out,
+        "red labels = non-length rejected strokes, slightly bolder values = failed checks",
+        (15, 72),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        red,
+        1,
+        cv2.LINE_AA,
+    )
+    return out
+
+
 def write_stroke_direction_debug_report(path, infos, line_strokes):
     """
     Write every stroke's direction for debugging.
@@ -4536,6 +7530,9 @@ def write_stroke_direction_debug_report(path, infos, line_strokes):
                 f"  stroke {int(s['index']):03d}: "
                 f"line_candidate={in_line}, "
                 f"arc={s['arc']:.1f}, chord={s['chord']:.1f}, straightness={s['straightness']:.3f}, "
+                f"p90_pca_line_error={s.get('p90_pca_line_error', 0.0):.2f}, "
+                f"pca_rms_error={s.get('pca_rms_error', 0.0):.2f}, "
+                f"chord_dev_ratio={s.get('chord_deviation_ratio', 0.0):.4f}, "
                 f"center=({c[0]:.1f},{c[1]:.1f}), "
                 f"p0=({p0[0]:.1f},{p0[1]:.1f}), p1=({p1[0]:.1f},{p1[1]:.1f}), "
                 f"pca_axis=({dbg['pca_axis'][0]:.6f},{dbg['pca_axis'][1]:.6f}), "
@@ -4577,6 +7574,10 @@ def write_stroke_direction_debug_json(path, infos, line_strokes):
                 "arc": float(s["arc"]),
                 "chord": float(s["chord"]),
                 "straightness": float(s["straightness"]),
+                "p90_pca_line_error": float(s.get("p90_pca_line_error", 0.0)),
+                "pca_rms_error": float(s.get("pca_rms_error", 0.0)),
+                "p90_chord_deviation": float(s.get("p90_chord_deviation", 0.0)),
+                "chord_deviation_ratio": float(s.get("chord_deviation_ratio", 0.0)),
                 "center": [float(x) for x in np.asarray(s["center"], dtype=float).tolist()],
                 "p0": [float(x) for x in np.asarray(s["points"][0], dtype=float).tolist()],
                 "p1": [float(x) for x in np.asarray(s["points"][-1], dtype=float).tolist()],
@@ -4638,7 +7639,62 @@ def direction_group_center(group):
     return np.mean(centers, axis=0)
 
 
-def write_direction_groups_debug_report(path, strokes, angle_thresh=25.0, min_stroke_length=None, min_straightness=None):
+def write_side_direction_prefilter_report(path, infos, args):
+    """Write all side-direction prefilter decisions before PCA clustering."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("==== Side Direction Prefilter ====\n\n")
+        f.write("These filters run before PCA direction clustering for side-stroke selection.\n\n")
+        f.write(f"min_stroke_length/arc: {float(args.min_stroke_length):.2f}\n")
+        f.write(f"side_min_chord_px: {float(args.side_min_chord_px):.2f}\n")
+        f.write(f"side_straightness: {float(args.side_straightness):.3f}\n")
+        f.write(f"side_line_p90_error_px: {float(args.side_line_p90_error_px):.2f}\n")
+        f.write(f"side_line_p90_error_ratio: {float(args.side_line_p90_error_ratio):.4f}\n")
+        f.write(f"side_line_rms_error_px: {float(args.side_line_rms_error_px):.2f}\n")
+        f.write(f"side_line_rms_error_ratio: {float(args.side_line_rms_error_ratio):.4f}\n")
+        f.write(f"side_chord_dev_ratio_max: {float(args.side_chord_dev_ratio_max):.4f}\n\n")
+
+        accepted_count = 0
+        rejected_count = 0
+        for s in infos:
+            result = side_direction_group_filter_result(
+                s,
+                min_length=args.min_stroke_length,
+                min_straightness=args.side_straightness,
+                min_chord=args.side_min_chord_px,
+                line_p90_error_px=args.side_line_p90_error_px,
+                line_p90_error_ratio=args.side_line_p90_error_ratio,
+                line_rms_error_px=args.side_line_rms_error_px,
+                line_rms_error_ratio=args.side_line_rms_error_ratio,
+                chord_dev_ratio_max=args.side_chord_dev_ratio_max,
+            )
+            if result["accepted"]:
+                accepted_count += 1
+            else:
+                rejected_count += 1
+
+            p90_limit = result["p90_pca_limit"]
+            rms_limit = result["pca_rms_limit"]
+            p90_limit_txt = "disabled" if p90_limit is None else f"{p90_limit:.2f}"
+            rms_limit_txt = "disabled" if rms_limit is None else f"{rms_limit:.2f}"
+            reasons = "OK" if result["accepted"] else "; ".join(result["reasons"])
+            f.write(
+                f"stroke {int(s['index']):03d}: "
+                f"{'ACCEPT' if result['accepted'] else 'reject'}; "
+                f"arc={float(s.get('arc', 0.0)):.1f}, "
+                f"chord={float(s.get('chord', 0.0)):.1f}, "
+                f"straightness={float(s.get('straightness', 0.0)):.3f}, "
+                f"p90_pca_line_error={float(s.get('p90_pca_line_error', 0.0)):.2f}/{p90_limit_txt}, "
+                f"pca_rms_error={float(s.get('pca_rms_error', 0.0)):.2f}/{rms_limit_txt}, "
+                f"p90_chord_deviation={float(s.get('p90_chord_deviation', 0.0)):.2f}, "
+                f"chord_dev_ratio={float(s.get('chord_deviation_ratio', 0.0)):.4f}; "
+                f"{reasons}\n"
+            )
+
+        f.write(f"\naccepted: {accepted_count}\n")
+        f.write(f"rejected: {rejected_count}\n")
+
+
+def write_direction_groups_debug_report(path, strokes, angle_thresh=25.0, min_stroke_length=None, min_straightness=None, args=None):
     """Write side-prefiltered direction groups produced by unoriented angle similarity."""
     groups = build_direction_clusters(strokes, angle_thresh=angle_thresh)
     with open(path, "w", encoding="utf-8") as f:
@@ -4647,6 +7703,17 @@ def write_direction_groups_debug_report(path, strokes, angle_thresh=25.0, min_st
             f.write(f"min_stroke_length: {float(min_stroke_length):.2f}\n")
         if min_straightness is not None:
             f.write(f"side_straightness: {float(min_straightness):.2f}\n")
+        if args is not None:
+            f.write(f"side_min_chord_px: {float(args.side_min_chord_px):.2f}\n")
+            f.write(
+                "side line p90 limit: "
+                f"max({float(args.side_line_p90_error_px):.2f}, chord * {float(args.side_line_p90_error_ratio):.4f})\n"
+            )
+            f.write(
+                "side line rms limit: "
+                f"max({float(args.side_line_rms_error_px):.2f}, chord * {float(args.side_line_rms_error_ratio):.4f})\n"
+            )
+            f.write(f"side_chord_dev_ratio_max: {float(args.side_chord_dev_ratio_max):.4f}\n")
         f.write(f"angle_thresh: {angle_thresh:.2f}\n")
         f.write("Grouping rule: strokes are connected when unoriented PCA angle <= threshold.\n")
         f.write("Same direction and opposite direction are treated as the same axis.\n\n")
@@ -4667,7 +7734,11 @@ def write_direction_groups_debug_report(path, strokes, angle_thresh=25.0, min_st
                     f"  stroke {int(s['index']):03d}: "
                     f"pca_angle={dbg['pca_angle']:.2f}, "
                     f"axis=({dbg['pca_axis'][0]:.4f},{dbg['pca_axis'][1]:.4f}), "
-                    f"arc={s['arc']:.1f}, straightness={s['straightness']:.3f}\n"
+                    f"arc={s['arc']:.1f}, chord={s['chord']:.1f}, "
+                    f"straightness={s['straightness']:.3f}, "
+                    f"p90_pca_line_error={s.get('p90_pca_line_error', 0.0):.2f}, "
+                    f"pca_rms_error={s.get('pca_rms_error', 0.0):.2f}, "
+                    f"chord_dev_ratio={s.get('chord_deviation_ratio', 0.0):.4f}\n"
                 )
 
 
@@ -4881,6 +7952,8 @@ def format_cluster_debug_entry(entry, selected_cluster_id=None):
         f"mean_angle={entry.get('mean_angle', axis_angle_0_180(direction)):.2f}, "
         f"max_mean_diff={entry.get('max_mean_angle_diff', 0.0):.2f}, "
         f"n={details.get('n', 0)}, "
+        f"count_term={details.get('score_count_term', 0.0):.1f}, "
+        f"same_loop_penalty_term={details.get('score_same_loop_penalty_term', 0.0):.1f}, "
         f"total_len={details.get('total_len', 0.0):.1f}, "
         f"mean_straight={details.get('mean_straight', 0.0):.3f}, "
         f"perp_spread={details.get('perp_spread', 0.0):.2f}, "
@@ -4895,7 +7968,11 @@ def format_cluster_debug_entry(entry, selected_cluster_id=None):
             f"best_cap_enclosed={details.get('best_cap_enclosed_area', 0)}, "
             f"best_cap_bbox_area={details.get('best_cap_bbox_area', 0)}, "
             f"best_sweep_iou={details.get('best_sweep_iou', 0.0):.4f}, "
+            f"side_cap_connected={details.get('side_cap_connected_count', 0)}/{details.get('side_cap_side_count', 0)}, "
+            f"side_cap_passed={details.get('side_cap_connect_passed', True)}, "
+            f"side_cap_ignored={details.get('side_cap_ignored_disconnected_strokes', [])}, "
             f"best_cap_strokes={details.get('best_cap_strokes', [])}, "
+            f"best_cap_topology={details.get('best_cap_topology_kind', '')}, "
         f"invalid_no_cap={details.get('invalid_no_cap', False)}, "
         f"selection_passed={details.get('selection_passed', False)}, "
         f"cap_selected={details.get('selected_by_cap_validation', False)}, "
@@ -4921,6 +7998,12 @@ def write_cluster_debug_report(path, model):
             d = model["direction"]
             f.write(f"selected_direction: ({d[0]:.6f}, {d[1]:.6f})\n")
         f.write(f"cluster_angle_thresh: {model.get('cluster_angle_thresh', None)}\n")
+        f.write(
+            "active_score_formula: count_weight * n - same_loop_penalty * same_loop_pairs\n"
+        )
+        f.write(
+            "connected-pair/length/straightness/spread/length-similarity fields below are diagnostics only.\n"
+        )
         f.write("\nRanked clusters:\n")
         for entry in cluster_debug:
             f.write("  " + format_cluster_debug_entry(entry, selected_cluster_id) + "\n")
@@ -4936,7 +8019,7 @@ def write_cluster_debug_report(path, model):
                 f"bonus={details.get('length_similarity_bonus', 0.0):.1f}\n"
             )
             if details.get("connected_pair_count", 0) > 0:
-                f.write(f"    connected_pairs={details.get('connected_pairs', [])} -> REJECTED_CLUSTER\n")
+                f.write(f"    connected_pairs={details.get('connected_pairs', [])} -> diagnostic_only\n")
             if details.get("cap_validation_checked", False):
                 f.write(
                 f"    cap_validation: total_candidates={details.get('cap_candidate_count', 0)}, "
@@ -4946,10 +8029,24 @@ def write_cluster_debug_report(path, model):
                 f"best_sweep_iou={details.get('best_sweep_iou', 0.0):.4f}, "
                 f"best_sweep_valid={details.get('best_sweep_valid', False)}, "
                 f"best_sweep_passed={details.get('best_sweep_passed', False)}, "
+                f"best_sweep_mask_source={details.get('best_sweep_mask_source', '')}, "
+                f"side_cap_connect_enabled={details.get('side_cap_connect_enabled', False)}, "
+                f"side_cap_connect_tol={details.get('side_cap_connect_tol', 0.0):.1f}, "
+                f"side_cap_connected={details.get('side_cap_connected_count', 0)}/{details.get('side_cap_side_count', 0)}, "
+                f"side_cap_range_checked={details.get('side_cap_range_checked_count', 0)}, "
+                f"side_cap_range_method={details.get('side_cap_range_method', '')}, "
+                f"side_cap_passed={details.get('side_cap_connect_passed', True)}, "
+                f"side_cap_disconnected={details.get('side_cap_disconnected_strokes', [])}, "
+                f"side_cap_ignored={details.get('side_cap_ignored_disconnected_strokes', [])}, "
                 f"best_strokes={details.get('best_cap_strokes', [])}, "
                 f"best_score={details.get('best_cap_score', 0.0):.1f}, "
                 f"best_center={details.get('best_cap_center', None)}, "
                 f"best_total_arc={details.get('best_cap_total_arc', 0.0):.1f}, "
+                f"best_topology={details.get('best_cap_topology_kind', '')}, "
+                f"loop_detection={details.get('best_cap_loop_detection', '')}, "
+                f"cycles={details.get('best_cap_topology_cycle_count', 0)}, "
+                f"simple_cycles={details.get('best_cap_topology_simple_cycle_count', 0)}, "
+                f"edge_disjoint_cover={details.get('best_cap_topology_edge_disjoint_cover', False)}, "
                     f"invalid_no_cap={details.get('invalid_no_cap', False)}, "
                     f"selectable={details.get('cap_validation_selectable', True)}, "
                     f"selected={details.get('selected_by_cap_validation', False)}\n"
@@ -4998,12 +8095,24 @@ def write_cap_search_trace_report(path, model):
                 f"checked={item.get('checked', False)}, "
                 f"result={status}, "
                 f"cap_count={int(item.get('cap_candidate_count', 0))}, "
+                f"cap_evaluated={int(item.get('cap_candidate_evaluated_count', 0))}, "
                 f"best_area={int(item.get('best_cap_area', 0))}, "
                 f"best_enclosed_area={int(item.get('best_cap_enclosed_area', 0))}, "
                 f"best_bbox_area={int(item.get('best_cap_bbox_area', 0))}, "
                 f"best_sweep_iou={float(item.get('best_sweep_iou', 0.0)):.4f}, "
                 f"best_sweep_valid={item.get('best_sweep_valid', False)}, "
+                f"best_sweep_mask_source={item.get('best_sweep_mask_source', '')}, "
+                f"side_cap_connected={int(item.get('side_cap_connected_count', 0))}/{int(item.get('side_cap_side_count', 0))}, "
+                f"side_cap_range_checked={int(item.get('side_cap_range_checked_count', 0))}, "
+                f"side_cap_range_method={item.get('side_cap_range_method', '')}, "
+                f"side_cap_passed={item.get('side_cap_connect_passed', True)}, "
+                f"side_cap_disconnected={item.get('side_cap_disconnected_strokes', [])}, "
+                f"side_cap_ignored={item.get('side_cap_ignored_disconnected_strokes', [])}, "
                 f"selection_passed={item.get('selection_passed', False)}, "
+                f"best_topology={item.get('best_cap_topology_kind', '')}, "
+                f"cycles={int(item.get('best_cap_topology_cycle_count', 0))}, "
+                f"simple_cycles={int(item.get('best_cap_topology_simple_cycle_count', 0))}, "
+                f"edge_disjoint_cover={item.get('best_cap_topology_edge_disjoint_cover', False)}, "
                 f"best_total_arc={float(item.get('best_cap_total_arc', 0.0)):.1f}, "
                 f"best_score={float(item.get('best_cap_score', 0.0)):.1f}, "
                 f"best_cap_strokes={item.get('best_cap_strokes', [])}\n"
@@ -5017,6 +8126,8 @@ def write_cap_search_round_report(path, model):
         f.write("==== Cap Search Rounds ====\n\n")
         if model is not None:
             f.write(f"sweep_gate_enabled: {bool(model.get('cap_sweep_gate_enabled', False))}\n")
+            f.write(f"side_cap_connect_enabled: {bool(model.get('side_cap_connect_enabled', False))}\n")
+            f.write(f"side_cap_connect_tol: {float(model.get('side_cap_connect_tol', 0.0)):.2f}\n")
         if not rounds:
             f.write("No round summary recorded.\n")
             return
@@ -5229,6 +8340,327 @@ def draw_cluster_best_cap_image(shape, entry, cap_candidate=None, selected=False
     return out
 
 
+def serialize_stroke_info_for_cap_pool(s):
+    """Serialize one stroke with the geometry needed to inspect cap-pool choices."""
+    pts = np.asarray(s.get("points", []), dtype=np.float64).reshape(-1, 2)
+    p0 = pts[0] if len(pts) > 0 else np.asarray([0.0, 0.0], dtype=np.float64)
+    p1 = pts[-1] if len(pts) > 0 else np.asarray([0.0, 0.0], dtype=np.float64)
+    center = np.asarray(s.get("center", (0.0, 0.0)), dtype=np.float64)
+    direction = np.asarray(s.get("direction", (0.0, 0.0)), dtype=np.float64)
+    return {
+        "index": int(s.get("index", -1)),
+        "arc": float(s.get("arc", 0.0)),
+        "chord": float(s.get("chord", 0.0)),
+        "straightness": float(s.get("straightness", 0.0)),
+        "p90_pca_line_error": float(s.get("p90_pca_line_error", 0.0)),
+        "pca_rms_error": float(s.get("pca_rms_error", 0.0)),
+        "p90_chord_deviation": float(s.get("p90_chord_deviation", 0.0)),
+        "chord_deviation_ratio": float(s.get("chord_deviation_ratio", 0.0)),
+        "center": [float(center[0]), float(center[1])],
+        "direction": [float(direction[0]), float(direction[1])],
+        "p0": [float(p0[0]), float(p0[1])],
+        "p1": [float(p1[0]), float(p1[1])],
+        "points": [[float(x), float(y)] for x, y in pts.tolist()],
+    }
+
+
+def draw_cap_pool_image(shape, entry, infos, cap_pool_infos):
+    """Visualize strokes available to cap-loop search for one side entry."""
+    h, w = shape[:2]
+    out = np.full((h, w, 3), 255, dtype=np.uint8)
+    side_ids = {int(s.get("index", -1)) for s in entry.get("strokes", [])}
+    cap_pool_ids = {int(s.get("index", -1)) for s in cap_pool_infos}
+    available_ids = cap_pool_ids - side_ids
+
+    for s in infos:
+        sid = int(s.get("index", -1))
+        pts = np.asarray(s["points"], dtype=np.float64).reshape(-1, 1, 2).astype(np.int32)
+        if sid in available_ids:
+            color = (0, 170, 0)
+            thickness = 3
+        elif sid in side_ids:
+            color = (255, 0, 0)
+            thickness = 4
+        elif sid in cap_pool_ids:
+            color = (160, 160, 160)
+            thickness = 2
+        else:
+            color = (225, 225, 225)
+            thickness = 1
+        cv2.polylines(out, [pts], False, color, thickness, cv2.LINE_AA)
+
+        if sid in available_ids or sid in side_ids:
+            c = np.asarray(s["center"], dtype=np.float64)
+            label = f"s{sid}"
+            cv2.putText(
+                out,
+                label,
+                (int(c[0]), int(c[1])),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+    cluster_id = int(entry.get("cluster_id", -1))
+    cv2.putText(
+        out,
+        f"C{cluster_id} cap stroke pool: green=available, blue=side excluded",
+        (15, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 0, 0),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        out,
+        f"available={len(available_ids)} side_excluded={len(side_ids & cap_pool_ids)} cap_pool_total={len(cap_pool_ids)}",
+        (15, 50),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.50,
+        (0, 0, 0),
+        1,
+        cv2.LINE_AA,
+    )
+    return out
+
+
+def write_cap_pool_debug_json(path, entry, rank, cap_pool_infos):
+    side_ids = {int(s.get("index", -1)) for s in entry.get("strokes", [])}
+    cap_pool_ids = {int(s.get("index", -1)) for s in cap_pool_infos}
+    available = [s for s in cap_pool_infos if int(s.get("index", -1)) not in side_ids]
+    excluded_side_pool = [s for s in cap_pool_infos if int(s.get("index", -1)) in side_ids]
+    payload = {
+        "rank": int(rank),
+        "cluster_id": int(entry.get("cluster_id", -1)),
+        "source": entry.get("source", "unknown"),
+        "parent_cluster_id": entry.get("parent_cluster_id", None),
+        "removal_depth": int(entry.get("removal_depth", 0)),
+        "removed_stroke_indices": list(entry.get("removed_stroke_indices", [])),
+        "side_indices": sorted(side_ids),
+        "cap_pool_indices_before_side_removal": sorted(cap_pool_ids),
+        "available_cap_pool_indices": [int(s.get("index", -1)) for s in available],
+        "side_indices_excluded_from_cap_pool": [int(s.get("index", -1)) for s in excluded_side_pool],
+        "available_cap_pool_count": int(len(available)),
+        "cap_pool_count_before_side_removal": int(len(cap_pool_infos)),
+        "available_cap_pool_strokes": [serialize_stroke_info_for_cap_pool(s) for s in available],
+        "side_strokes_excluded_from_cap_pool": [serialize_stroke_info_for_cap_pool(s) for s in excluded_side_pool],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(json_safe_debug_value(payload), f, indent=2)
+
+
+def component_endpoint_debug_records(strokes, comp, endpoint_tol):
+    records = []
+    comp = list(map(int, comp))
+    for stroke_local_i in comp:
+        s = strokes[stroke_local_i]
+        for endpoint_i, p in enumerate(stroke_endpoint_points(s)):
+            degree, matches = endpoint_connection_degree_in_component(
+                strokes,
+                comp,
+                stroke_local_i,
+                endpoint_i,
+                endpoint_tol=endpoint_tol,
+            )
+            records.append({
+                "stroke": int(s.get("index", -1)),
+                "role": "start" if endpoint_i == 0 else "end",
+                "point": [float(p[0]), float(p[1])],
+                "degree": int(degree),
+                "matches": [
+                    {
+                        "stroke": int(match_stroke),
+                        "role": "start" if int(match_endpoint_i) == 0 else "end",
+                    }
+                    for match_stroke, match_endpoint_i in matches
+                ],
+            })
+    return records
+
+
+def write_component_normalization_debug_json(path, entry, rank, cap_pool_infos, endpoint_tol):
+    side_ids = {int(s.get("index", -1)) for s in entry.get("strokes", [])}
+    non_side_infos = [s for s in cap_pool_infos if int(s.get("index", -1)) not in side_ids]
+    comps = connected_components_by_endpoint_proximity(non_side_infos, endpoint_tol=endpoint_tol)
+
+    component_records = []
+    for component_i, comp in enumerate(comps):
+        comp = list(map(int, comp))
+        normalized = normalize_cap_loop_component(
+            non_side_infos,
+            comp,
+            endpoint_tol=endpoint_tol,
+        )
+        norm_comp = list(map(int, normalized.get("component_local_indices", [])))
+        component_records.append({
+            "component_index": int(component_i),
+            "component": {
+                "local_indices": comp,
+                "stroke_indices": [int(non_side_infos[i].get("index", -1)) for i in comp],
+                "closed": bool(is_closed_stroke_component_by_endpoint_proximity(
+                    non_side_infos,
+                    comp,
+                    endpoint_tol=endpoint_tol,
+                )),
+                "endpoints": component_endpoint_debug_records(
+                    non_side_infos,
+                    comp,
+                    endpoint_tol,
+                ),
+            },
+            "normalized_component": {
+                "local_indices": norm_comp,
+                "stroke_indices": [int(non_side_infos[i].get("index", -1)) for i in norm_comp],
+                "closed": bool(normalized.get("closed", False)),
+                "removed_open_branch_strokes": list(normalized.get("removed_open_branch_strokes", [])),
+                "removed_post_loop_self_strokes": list(normalized.get("removed_post_loop_self_strokes", [])),
+                "trace": list(normalized.get("trace", [])),
+                "endpoints": component_endpoint_debug_records(
+                    non_side_infos,
+                    norm_comp,
+                    endpoint_tol,
+                ) if norm_comp else [],
+            },
+        })
+
+    payload = {
+        "rank": int(rank),
+        "cluster_id": int(entry.get("cluster_id", -1)),
+        "source": entry.get("source", "unknown"),
+        "parent_cluster_id": entry.get("parent_cluster_id", None),
+        "removal_depth": int(entry.get("removal_depth", 0)),
+        "removed_stroke_indices": list(entry.get("removed_stroke_indices", [])),
+        "side_indices": sorted(side_ids),
+        "endpoint_tol": float(endpoint_tol),
+        "non_side_cap_pool_indices": [int(s.get("index", -1)) for s in non_side_infos],
+        "component_count": int(len(component_records)),
+        "components": component_records,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(json_safe_debug_value(payload), f, indent=2)
+
+
+def draw_component_normalization_image(shape, entry, cap_pool_infos, endpoint_tol, component_index=None):
+    """Draw raw and normalized cap components for one side-cluster trial."""
+    h, w = shape[:2]
+    out = np.full((h, w, 3), 255, dtype=np.uint8)
+    side_ids = {int(s.get("index", -1)) for s in entry.get("strokes", [])}
+    non_side_infos = [s for s in cap_pool_infos if int(s.get("index", -1)) not in side_ids]
+    comps = connected_components_by_endpoint_proximity(non_side_infos, endpoint_tol=endpoint_tol)
+
+    for s in entry.get("strokes", []):
+        pts = s["points"].reshape(-1, 1, 2).astype(np.int32)
+        cv2.polylines(out, [pts], False, (0, 0, 255), 4, cv2.LINE_AA)
+        c = s["center"]
+        cv2.putText(out, f"side s{int(s['index'])}", (int(c[0]), int(c[1])),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 0, 160), 1, cv2.LINE_AA)
+
+    selected_component_indices = (
+        set(range(len(comps)))
+        if component_index is None
+        else {int(component_index)}
+    )
+
+    for ci, comp in enumerate(comps):
+        if ci not in selected_component_indices:
+            continue
+        comp = list(map(int, comp))
+        normalized = normalize_cap_loop_component(non_side_infos, comp, endpoint_tol=endpoint_tol)
+        norm_comp = list(map(int, normalized.get("component_local_indices", [])))
+        norm_set = set(norm_comp)
+        removed_branch = set(int(x) for x in normalized.get("removed_open_branch_strokes", []))
+        removed_self = set(int(x) for x in normalized.get("removed_post_loop_self_strokes", []))
+        normalized_closed = bool(normalized.get("closed", False))
+        color = random_color(ci + 80)
+        norm_color = (0, 170, 0) if normalized_closed else (0, 140, 255)
+
+        all_points = []
+        for li in comp:
+            s = non_side_infos[li]
+            pts = s["points"].reshape(-1, 1, 2).astype(np.int32)
+            cv2.polylines(out, [pts], False, (210, 210, 210), 2, cv2.LINE_AA)
+            all_points.extend([np.asarray(p, dtype=np.float64) for p in stroke_endpoint_points(s)])
+
+        for li in comp:
+            s = non_side_infos[li]
+            pts = s["points"].reshape(-1, 1, 2).astype(np.int32)
+            sid = int(s["index"])
+            if li in norm_set:
+                stroke_color = norm_color
+                thickness = 4
+                label_prefix = "norm"
+            elif sid in removed_branch or sid in removed_self:
+                stroke_color = (150, 150, 150)
+                thickness = 2
+                label_prefix = "removed"
+            else:
+                stroke_color = color
+                thickness = 2
+                label_prefix = "raw"
+            cv2.polylines(out, [pts], False, stroke_color, thickness, cv2.LINE_AA)
+            c = s["center"]
+            cv2.putText(out, f"{label_prefix} s{sid}", (int(c[0]), int(c[1])),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, stroke_color, 1, cv2.LINE_AA)
+
+        for li in norm_comp:
+            s = non_side_infos[li]
+            for endpoint_i, p in enumerate(stroke_endpoint_points(s)):
+                degree, _matches = endpoint_connection_degree_in_component(
+                    non_side_infos,
+                    norm_comp,
+                    li,
+                    endpoint_i,
+                    endpoint_tol=endpoint_tol,
+                )
+                px, py = int(round(float(p[0]))), int(round(float(p[1])))
+                endpoint_color = (0, 150, 0) if degree == 1 else (0, 0, 255)
+                cv2.circle(out, (px, py), 5 if degree == 1 else 7, endpoint_color, 2, cv2.LINE_AA)
+                cv2.putText(out, f"d{degree}", (px + 5, py - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.32, endpoint_color, 1, cv2.LINE_AA)
+
+        if all_points:
+            label_pos = np.mean(np.asarray(all_points), axis=0)
+            status = "closed" if normalized_closed else "open"
+            norm_strokes = [int(non_side_infos[i]["index"]) for i in norm_comp]
+            cv2.putText(out, f"component {ci}: normalized {status}, strokes={norm_strokes}",
+                        (int(label_pos[0]) + 8, int(label_pos[1]) - 12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, norm_color, 1, cv2.LINE_AA)
+
+    title_component = "all" if component_index is None else str(int(component_index))
+    cv2.putText(out, f"cluster {entry.get('cluster_id', -1)} normalized cap components: {title_component}",
+                (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.putText(out, "red=side removed; green=normalized closed; orange=normalized open; gray=removed/raw",
+                (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 1, cv2.LINE_AA)
+    return out
+
+
+def save_component_normalization_debug_pngs(out_dir, img_shape, entry, cap_pool_infos, endpoint_tol):
+    """Write normalized cap component overview and per-component PNGs."""
+    os.makedirs(out_dir, exist_ok=True)
+    cv2.imwrite(
+        os.path.join(out_dir, "components_normalized.png"),
+        draw_component_normalization_image(img_shape, entry, cap_pool_infos, endpoint_tol),
+    )
+
+    side_ids = {int(s.get("index", -1)) for s in entry.get("strokes", [])}
+    non_side_infos = [s for s in cap_pool_infos if int(s.get("index", -1)) not in side_ids]
+    comps = connected_components_by_endpoint_proximity(non_side_infos, endpoint_tol=endpoint_tol)
+    for ci, _comp in enumerate(comps):
+        cv2.imwrite(
+            os.path.join(out_dir, f"normalized_component_{ci:03d}.png"),
+            draw_component_normalization_image(
+                img_shape,
+                entry,
+                cap_pool_infos,
+                endpoint_tol,
+                component_index=ci,
+            ),
+        )
+
+
 def nearest_mask_point(point, mask_points):
     """Return the closest mask point to a 2D point."""
     if mask_points is None or len(mask_points) == 0:
@@ -5354,7 +8786,7 @@ def longest_side_stroke_copy_geometry(
     if len(xs) == 0:
         return None
     cap_points = np.column_stack([xs, ys]).astype(np.float64)
-    iou_cap_mask = cap_candidate.get("mask", None)
+    iou_cap_mask = cap_mask if cap_mask_override is not None else cap_candidate.get("mask", None)
     if iou_cap_mask is None or np.count_nonzero(iou_cap_mask > 0) == 0:
         iou_cap_mask = cap_mask
     iou_ys, iou_xs = np.where(iou_cap_mask > 0)
@@ -5774,12 +9206,20 @@ def save_cap_endpoint_graph_debug_outputs(debug_dir, img_shape, model, infos, ar
         f.write("==== Cap Endpoint Graph Summary ====\n\n")
         f.write(f"cap_pool: strokes with arc >= {float(args.min_stroke_length):.1f}\n")
         f.write(f"endpoint_tol: {float(args.cap_loop_endpoint_tol):.1f}\n")
-        f.write("Only original direction groups are listed. Subgroups are omitted.\n\n")
+        f.write("Original direction groups are listed. Selected/pass subgroups are also listed so 3D recovery can use their endpoint graph.\n\n")
+
+        selected_cluster_id = model.get("selected_cluster_id", None)
+
+        def should_emit_endpoint_graph(entry):
+            if int(entry.get("removal_depth", 0)) == 0 and entry.get("parent_cluster_id", None) is None:
+                return True
+            details = entry.get("details", {})
+            if selected_cluster_id is not None and int(entry.get("cluster_id", -1)) == int(selected_cluster_id):
+                return True
+            return bool(details.get("selection_passed", False) or details.get("selected_by_cap_validation", False))
 
         for entry in cluster_debug:
-            if int(entry.get("removal_depth", 0)) != 0:
-                continue
-            if entry.get("parent_cluster_id", None) is not None:
+            if not should_emit_endpoint_graph(entry):
                 continue
             cluster_id = int(entry.get("cluster_id", -1))
             img = draw_cap_endpoint_graph_image(
@@ -5859,6 +9299,17 @@ def successful_direction_parent_ids(model):
             parent_id = item.get("cluster_id", None)
         if parent_id is not None:
             ids.add(int(parent_id))
+    selected_cluster_id = model.get("selected_cluster_id", None)
+    if selected_cluster_id is not None:
+        for entry in model.get("cluster_debug", []):
+            if int(entry.get("cluster_id", -1)) != int(selected_cluster_id):
+                continue
+            parent_id = entry.get("parent_cluster_id", None)
+            if parent_id is None:
+                parent_id = entry.get("cluster_id", None)
+            if parent_id is not None:
+                ids.add(int(parent_id))
+            break
     return ids
 
 
@@ -6180,7 +9631,7 @@ def build_bbox_masks_geometric(
     iou_compare_percent=None,
 ):
     """
-    IoU / sweep masks use the original curved cap stroke pixels from cap_candidate["mask"].
+    IoU / sweep masks use a strict endpoint-ordered, gap-bridged, filled cap face.
 
     Sweep vector = longest side stroke by arc length, oriented near→far vs source cap mask.
     """
@@ -6193,16 +9644,19 @@ def build_bbox_masks_geometric(
         return None
     bt = max(2, int(cap_loop_thickness))
 
-    raw_source = cap_candidate.get("mask", None)
-    if raw_source is None or np.count_nonzero(raw_source > 0) == 0:
+    source_cap, mask_source = cap_ordered_filled_sweep_source_mask(
+        cap_candidate,
+        infos,
+        endpoint_tol=endpoint_tol,
+        thickness=bt,
+    )
+    if source_cap is None or np.count_nonzero(source_cap > 0) == 0:
         return None
-    raw_source = (raw_source > 0).astype(np.uint8) * 255
-    mask_source = "cap_candidate_original_curved_stroke_pixels"
 
     geometry = longest_side_stroke_copy_geometry(
         entry,
         cap_candidate,
-        cap_mask_override=raw_source,
+        cap_mask_override=source_cap,
         direction_angle_tol=copy_direction_angle_tol,
         sketch_mask=sketch_mask,
         iou_compare_percent=iou_compare_percent,
@@ -6210,12 +9664,12 @@ def build_bbox_masks_geometric(
     if geometry is None:
         return None
     vec = geometry["vector"]
-    copied_cap = translate_mask(raw_source, vec)
+    copied_cap = translate_mask(source_cap, vec)
     side_bin = rasterize_side_strokes(shape, entry.get("strokes", []), thickness=4)
-    swept_cap = fill_binary_mask(sweep_mask_along_vector(raw_source, vec))
+    swept_cap = fill_binary_mask(sweep_mask_along_vector(source_cap, vec))
     occupied = fill_binary_mask(swept_cap)
     return {
-        "source_cap": raw_source,
+        "source_cap": source_cap,
         "copied_cap": copied_cap,
         "side_strokes": side_bin,
         "swept_cap": swept_cap,
@@ -6301,6 +9755,7 @@ def compute_cap_sweep_similarity(
         iou_compare_percent=iou_compare_percent,
     )
     if masks is None:
+        result["mask_source"] = "strict_filled_cap_unavailable"
         return result
 
     occupied = masks.get("occupied", None)
@@ -6422,20 +9877,454 @@ def clean_ranked_output_dir(path):
             os.remove(os.path.join(path, name))
 
 
+def clean_debug_artifact_dir(path, remove_dirs=False):
+    os.makedirs(path, exist_ok=True)
+    for name in os.listdir(path):
+        full_path = os.path.join(path, name)
+        if os.path.isdir(full_path):
+            if remove_dirs:
+                shutil.rmtree(full_path)
+            continue
+        if name.lower().endswith(('.png', '.txt', '.json')):
+            os.remove(full_path)
+
+
+def prepare_cluster_progress_debug_dir(debug_dir):
+    if debug_dir is None:
+        return
+    clean_debug_artifact_dir(os.path.join(debug_dir, 'clusters'), remove_dirs=True)
+
+
+def cluster_debug_base_name(entry, rank):
+    safe_score = sanitize_score_for_filename(float(entry.get('score', 0.0)))
+    cluster_id = int(entry.get('cluster_id', -1))
+    return f'rank_{rank:02d}_cluster_{cluster_id:02d}_score_{safe_score}'
+
+
+def write_cluster_progress_status(debug_dir, entry, rank, phase, **extra):
+    if debug_dir is None:
+        return
+
+    cluster_dir = os.path.join(debug_dir, 'clusters')
+    os.makedirs(cluster_dir, exist_ok=True)
+    base = cluster_debug_base_name(entry, rank)
+    out_dir = os.path.join(cluster_dir, base)
+    os.makedirs(out_dir, exist_ok=True)
+
+    payload = {
+        'updated_at': datetime.now().isoformat(timespec='seconds'),
+        'phase': str(phase),
+        'rank': int(rank),
+        'base': base,
+        'cluster_id': int(entry.get('cluster_id', -1)),
+        'source': entry.get('source', 'unknown'),
+        'parent_cluster_id': entry.get('parent_cluster_id', None),
+        'removal_depth': int(entry.get('removal_depth', 0)),
+        'removed_stroke_indices': list(entry.get('removed_stroke_indices', [])),
+        'side_indices': [int(s['index']) for s in entry.get('strokes', [])],
+        'n_strokes': int(len(entry.get('strokes', []))),
+    }
+    payload.update(json_safe_debug_value(extra))
+
+    for path in (
+        os.path.join(cluster_dir, 'current_status.json'),
+        os.path.join(out_dir, 'status.json'),
+    ):
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2)
+
+
+def write_cluster_cap_search_step(debug_dir, entry, rank, event, **extra):
+    if debug_dir is None:
+        return
+
+    cluster_dir = os.path.join(debug_dir, 'clusters')
+    os.makedirs(cluster_dir, exist_ok=True)
+    base = cluster_debug_base_name(entry, rank)
+    out_dir = os.path.join(cluster_dir, base)
+    os.makedirs(out_dir, exist_ok=True)
+
+    payload = {
+        'updated_at': datetime.now().isoformat(timespec='seconds'),
+        'event': str(event),
+        'rank': int(rank),
+        'base': base,
+        'cluster_id': int(entry.get('cluster_id', -1)),
+        'source': entry.get('source', 'unknown'),
+        'parent_cluster_id': entry.get('parent_cluster_id', None),
+        'removal_depth': int(entry.get('removal_depth', 0)),
+        'removed_stroke_indices': list(entry.get('removed_stroke_indices', [])),
+        'side_indices': [int(s['index']) for s in entry.get('strokes', [])],
+        'n_strokes': int(len(entry.get('strokes', []))),
+    }
+    payload.update(json_safe_debug_value(extra))
+
+    live_path = os.path.join(out_dir, 'cap_search_live.json')
+    with open(live_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2)
+
+    steps_path = os.path.join(out_dir, 'cap_search_steps.jsonl')
+    with open(steps_path, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(payload, ensure_ascii=True) + '\n')
+
+
+def save_cluster_progress_preview_outputs(debug_dir, img_shape, entry, rank, infos, cap_pool_infos, endpoint_tol):
+    if debug_dir is None:
+        return
+
+    cluster_dir = os.path.join(debug_dir, 'clusters')
+    os.makedirs(cluster_dir, exist_ok=True)
+    out_dir = os.path.join(cluster_dir, cluster_debug_base_name(entry, rank))
+    os.makedirs(out_dir, exist_ok=True)
+
+    cv2.imwrite(os.path.join(out_dir, 'cluster.png'), draw_single_cluster_image(img_shape, entry, selected=False, thickness=4))
+    cv2.imwrite(os.path.join(out_dir, 'cap_pool.png'), draw_cap_pool_image(img_shape, entry, infos, cap_pool_infos))
+    write_cap_pool_debug_json(os.path.join(out_dir, 'cap_pool.json'), entry, rank, cap_pool_infos)
+    write_component_normalization_debug_json(
+        os.path.join(out_dir, 'components_normalized.json'),
+        entry,
+        rank,
+        cap_pool_infos,
+        endpoint_tol,
+    )
+    save_component_normalization_debug_pngs(
+        out_dir,
+        img_shape,
+        entry,
+        cap_pool_infos,
+        endpoint_tol,
+    )
+
+
+def json_safe_debug_value(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(k): json_safe_debug_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe_debug_value(v) for v in value]
+    return value
+
+
+def serialize_cap_candidate_for_debug(cap_candidate):
+    if cap_candidate is None:
+        return None
+    payload = {}
+    for key, value in cap_candidate.items():
+        if key in {'mask', 'enclosed_mask'}:
+            continue
+        payload[key] = json_safe_debug_value(value)
+    mask = cap_candidate.get('mask', None)
+    enclosed_mask = cap_candidate.get('enclosed_mask', None)
+    payload['mask_area'] = 0 if mask is None else int(binary_mask_area(mask))
+    payload['enclosed_mask_area'] = 0 if enclosed_mask is None else int(binary_mask_area(enclosed_mask))
+    return payload
+
+
+def summarize_cap_candidate_for_status(cap_candidate):
+    if cap_candidate is None:
+        return None
+    return {
+        'area': int(cap_candidate.get('area', 0)),
+        'enclosed_area': int(cap_candidate.get('enclosed_area', 0)),
+        'bbox_area': int(cap_candidate.get('bbox_area', 0)),
+        'score': float(cap_candidate.get('score', 0.0)),
+        'total_arc': float(cap_candidate.get('total_arc', 0.0)),
+        'stroke_indices': [int(x) for x in cap_candidate.get('stroke_indices', [])],
+        'topology_kind': cap_candidate.get('topology_kind', ''),
+        'loop_detection': cap_candidate.get('loop_detection', ''),
+        'mask_area': 0 if cap_candidate.get('mask', None) is None else int(binary_mask_area(cap_candidate['mask'])),
+        'enclosed_mask_area': (
+            0
+            if cap_candidate.get('enclosed_mask', None) is None
+            else int(binary_mask_area(cap_candidate['enclosed_mask']))
+        ),
+    }
+
+
+def cluster_candidate_failure_reasons(result, sweep_gate_enabled=False, sweep_iou_stop_thresh=0.0):
+    reasons = []
+    cap_candidate = result.get('cap_candidate', None)
+    if cap_candidate is None:
+        reasons.append('no_cap')
+        return reasons
+
+    sweep_info = result.get('sweep_info') or {}
+    if sweep_gate_enabled:
+        if not bool(sweep_info.get('valid', False)):
+            reasons.append('sweep_invalid')
+        elif float(sweep_info.get('iou', 0.0)) < float(sweep_iou_stop_thresh):
+            reasons.append(f'sweep_iou_below_{float(sweep_iou_stop_thresh):.4f}')
+
+    connection_info = result.get('connection_info') or {}
+    if not bool(connection_info.get('passed', True)):
+        reasons.append('side_cap_disconnected')
+
+    if not result.get('selection_passed', False) and not reasons:
+        reasons.append('selection_rejected')
+    return reasons
+
+
+def save_single_cluster_candidate_debug_output(
+    debug_dir,
+    img_shape,
+    entry,
+    rank,
+    infos,
+    cap_pool_infos,
+    best_cap,
+    cap_evaluations,
+    endpoint_tol,
+    cap_loop_thickness,
+    valid_input_enclosed_mask=None,
+    sweep_gate_enabled=False,
+    sweep_iou_stop_thresh=0.0,
+    copy_direction_angle_tol=None,
+    copy_iou_compare_percent=None,
+):
+    if debug_dir is None:
+        return
+
+    cluster_dir = os.path.join(debug_dir, 'clusters')
+    os.makedirs(cluster_dir, exist_ok=True)
+    base = cluster_debug_base_name(entry, rank)
+    out_dir = os.path.join(cluster_dir, base)
+    clean_debug_artifact_dir(out_dir, remove_dirs=True)
+
+    details = entry.get('details', {})
+    sketch_mask = valid_input_enclosed_mask
+    sketch_area = binary_mask_area(sketch_mask) if sketch_mask is not None else 0
+    cap_pool_infos = infos if cap_pool_infos is None else cap_pool_infos
+
+    cv2.imwrite(os.path.join(out_dir, 'cluster.png'), draw_single_cluster_image(img_shape, entry, selected=False, thickness=4))
+    cv2.imwrite(os.path.join(out_dir, 'best_cap.png'), draw_cluster_best_cap_image(img_shape, entry, cap_candidate=best_cap, selected=False))
+    cv2.imwrite(os.path.join(out_dir, 'cap_pool.png'), draw_cap_pool_image(img_shape, entry, infos, cap_pool_infos))
+    write_cap_pool_debug_json(os.path.join(out_dir, 'cap_pool.json'), entry, rank, cap_pool_infos)
+    write_component_normalization_debug_json(
+        os.path.join(out_dir, 'components_normalized.json'),
+        entry,
+        rank,
+        cap_pool_infos,
+        endpoint_tol,
+    )
+    save_component_normalization_debug_pngs(
+        out_dir,
+        img_shape,
+        entry,
+        cap_pool_infos,
+        endpoint_tol,
+    )
+
+    best_eval_index = None
+    for idx, result in enumerate(cap_evaluations):
+        if result.get('cap_candidate') is best_cap and best_cap is not None:
+            best_eval_index = idx
+            break
+
+    candidate_summaries = []
+    for idx, result in enumerate(cap_evaluations):
+        cap_candidate = result.get('cap_candidate')
+        sweep_info = result.get('sweep_info') or {}
+        connection_info = result.get('connection_info') or {}
+        prefix = f'candidate_{idx:02d}'
+
+        bbox_masks = None
+        if cap_candidate is not None:
+            bbox_masks = save_bbox_masks_geometric(
+                out_dir,
+                prefix,
+                img_shape,
+                entry,
+                cap_candidate,
+                infos,
+                endpoint_tol=endpoint_tol,
+                cap_loop_thickness=cap_loop_thickness,
+                debug_dir=debug_dir,
+                copy_direction_angle_tol=copy_direction_angle_tol,
+                sketch_mask=sketch_mask,
+                iou_compare_percent=copy_iou_compare_percent,
+            )
+
+        overlay_geometry = bbox_masks.get('geometry') if bbox_masks is not None else sweep_info.get('geometry', None)
+        overlay_img = draw_cluster_side_and_best_cap_overlay(
+            img_shape,
+            entry,
+            cap_candidate=cap_candidate,
+            selected=False,
+            copy_direction_angle_tol=copy_direction_angle_tol,
+            sketch_mask=sketch_mask,
+            copy_geometry_override=overlay_geometry,
+            iou_compare_percent=copy_iou_compare_percent,
+        )
+        cv2.imwrite(os.path.join(out_dir, prefix + '_overlay.png'), overlay_img)
+        cv2.imwrite(os.path.join(out_dir, prefix + '_cap.png'), draw_cluster_best_cap_image(img_shape, entry, cap_candidate=cap_candidate, selected=False))
+
+        sweep_img = None
+        if bbox_masks is None and cap_candidate is not None:
+            bbox_vector = estimate_cap_to_far_side_vector(
+                entry,
+                cap_candidate,
+                direction_angle_tol=copy_direction_angle_tol,
+                sketch_mask=sketch_mask,
+                iou_compare_percent=copy_iou_compare_percent,
+            )
+            if bbox_vector is not None:
+                bbox_masks = save_bbox_masks_from_overlay(out_dir, prefix, overlay_img, bbox_vector)
+                sweep_img = draw_bbox_from_bestcap_overlay(overlay_img, bbox_vector)
+        elif bbox_masks is not None:
+            sweep_img = draw_cap_sweep_visualization(bbox_masks)
+
+        candidate_iou = 0.0
+        candidate_intersection = 0
+        candidate_union = 0
+        candidate_sweep_area = 0
+        if bbox_masks is not None and sweep_img is not None:
+            cv2.imwrite(os.path.join(out_dir, prefix + '_cap_sweep.png'), sweep_img)
+            if sketch_area > 0 and sketch_mask is not None:
+                candidate_sweep_area = int(binary_mask_area(bbox_masks['occupied']))
+                candidate_iou, candidate_intersection, candidate_union = binary_mask_iou(bbox_masks['occupied'], sketch_mask)
+
+        payload = {
+            'candidate_index': int(idx),
+            'is_best_candidate': bool(idx == best_eval_index),
+            'selection_passed': bool(result.get('selection_passed', False)),
+            'failure_reasons': cluster_candidate_failure_reasons(
+                result,
+                sweep_gate_enabled=sweep_gate_enabled,
+                sweep_iou_stop_thresh=sweep_iou_stop_thresh,
+            ),
+            'cap_candidate': serialize_cap_candidate_for_debug(cap_candidate),
+            'sweep_info': json_safe_debug_value(sweep_info),
+            'connection_info': json_safe_debug_value(connection_info),
+            'saved_files': {
+                'cap_png': prefix + '_cap.png',
+                'overlay_png': prefix + '_overlay.png',
+                'cap_sweep_png': None if sweep_img is None else prefix + '_cap_sweep.png',
+                'source_cap_mask_png': None if bbox_masks is None else prefix + '_mask_source_cap.png',
+                'copied_cap_mask_png': None if bbox_masks is None else prefix + '_mask_copied_cap.png',
+                'side_strokes_mask_png': None if bbox_masks is None else prefix + '_mask_side_strokes.png',
+                'swept_cap_mask_png': None if bbox_masks is None else prefix + '_mask_swept_cap.png',
+                'occupied_mask_png': None if bbox_masks is None else prefix + '_mask_extrusion_occupied.png',
+            },
+            'debug_metrics': {
+                'occupied_iou_vs_sketch': float(candidate_iou),
+                'occupied_intersection': int(candidate_intersection),
+                'occupied_union': int(candidate_union),
+                'occupied_area': int(candidate_sweep_area),
+            },
+        }
+        with open(os.path.join(out_dir, prefix + '.json'), 'w', encoding='utf-8') as f:
+            json.dump(json_safe_debug_value(payload), f, indent=2)
+        candidate_summaries.append(payload)
+
+    summary = {
+        'rank': int(rank),
+        'cluster_id': int(entry.get('cluster_id', -1)),
+        'score': float(entry.get('score', 0.0)),
+        'source': entry.get('source', 'unknown'),
+        'parent_cluster_id': entry.get('parent_cluster_id', None),
+        'removal_depth': int(entry.get('removal_depth', 0)),
+        'removed_stroke_indices': list(entry.get('removed_stroke_indices', [])),
+        'side_indices': [int(i) for i in entry.get('indices', [])],
+        'n': int(details.get('n', len(entry.get('strokes', [])))),
+        'direction': json_safe_debug_value(entry.get('direction', None)),
+        'details': json_safe_debug_value(details),
+        'best_cap': serialize_cap_candidate_for_debug(best_cap),
+        'best_candidate_index': None if best_eval_index is None else int(best_eval_index),
+        'candidate_count': int(len(cap_evaluations)),
+        'sweep_gate_enabled': bool(sweep_gate_enabled),
+        'sweep_iou_stop_thresh': float(sweep_iou_stop_thresh),
+        'sketch_area': int(sketch_area),
+        'files': {
+            'cluster_png': 'cluster.png',
+            'best_cap_png': 'best_cap.png',
+            'cap_pool_png': 'cap_pool.png',
+            'cap_pool_json': 'cap_pool.json',
+            'components_normalized_png': 'components_normalized.png',
+            'components_normalized_json': 'components_normalized.json',
+        },
+        'candidates': candidate_summaries,
+    }
+    with open(os.path.join(out_dir, 'summary.json'), 'w', encoding='utf-8') as f:
+        json.dump(json_safe_debug_value(summary), f, indent=2)
+
+
 def save_iou_ranked_side_bestcap_overlays(debug_dir, records, sketch_area):
-    """Save side/cap overlays ordered by IoU with the sketch enclosed mask."""
+    """Save IoU-ranked side/cap overlays in the legacy format consumed by 3D recovery."""
     if not records:
         return
 
     ranked_dir = os.path.join(debug_dir, "cluster_side_caps_iou_ranked")
     clean_ranked_output_dir(ranked_dir)
 
-    sorted_records = sorted(records, key=lambda r: r["iou"], reverse=True)
+    passed_records = [r for r in records if r.get("selection_passed", False)]
+    ranking_mode = "selection_passed"
+    if passed_records:
+        sorted_records = sorted(passed_records, key=lambda r: r["iou"], reverse=True)
+    else:
+        ranking_mode = "selected_iou_fallback"
+        fallback_candidates = [r for r in records if r.get("selected_by_iou_fallback", False)]
+        if not fallback_candidates:
+            fallback_candidates = [
+                r
+                for r in records
+                if r.get("selected", False) and not r.get("selection_passed", False)
+            ]
+        if not fallback_candidates:
+            fallback_candidates = [
+                r
+                for r in records
+                if (
+                    not r.get("selection_passed", False)
+                    and r.get("side_cap_passed", True)
+                    and float(r.get("iou", 0.0)) > 0.0
+                )
+            ]
+            if fallback_candidates:
+                ranking_mode = "best_rejected_iou_fallback"
+        fallback_record = max(
+            fallback_candidates,
+            key=lambda r: (
+                float(r.get("iou", 0.0)),
+                1 if r.get("selected", False) else 0,
+                1 if r.get("side_cap_passed", True) else 0,
+            ),
+            default=None,
+        )
+        sorted_records = [fallback_record] if fallback_record is not None else []
+        if not sorted_records:
+            ranking_mode = "none"
+
+    ranked_record_ids = {id(r) for r in sorted_records}
+    rejected_records = [
+        r
+        for r in records
+        if not r.get("selection_passed", False) and id(r) not in ranked_record_ids
+    ]
     summary_path = os.path.join(ranked_dir, "iou_similarity_summary.txt")
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write("==== Cap Sweep IoU Similarity Ranking ====\n\n")
+        if ranking_mode == "selection_passed":
+            f.write("Candidates with selection_passed=True are ranked and written as overlay images here.\n")
+        elif sorted_records:
+            f.write(
+                "No candidate had selection_passed=True. The chosen fallback candidate is written as iou_rank 00 so downstream 3D recovery can consume it unchanged.\n"
+            )
+        else:
+            f.write("No selection-passed or fallback candidate was available for IoU ranking output.\n")
+        f.write(f"ranking_mode: {ranking_mode}\n")
         f.write(f"sketch_mask_area: {int(sketch_area)}\n")
+        f.write(f"all_iou_records: {len(records)}\n")
+        f.write(f"ranked_overlay_records: {len(sorted_records)}\n")
+        f.write(f"ranked_selection_passed_records: {len(passed_records)}\n")
+        f.write(f"ranked_fallback_records: {0 if ranking_mode == 'selection_passed' else len(sorted_records)}\n")
+        f.write(f"filtered_rejected_records: {len(rejected_records)}\n")
         f.write("iou = intersection(mask_extrusion_occupied, sketch_enclosed_mask) / union(...)\n\n")
+
+        if not sorted_records:
+            f.write("No side/cap overlay records were written.\n")
 
         for sorted_rank, record in enumerate(sorted_records):
             iou_tag = int(round(record["iou"] * 10000))
@@ -6451,8 +10340,36 @@ def save_iou_ranked_side_bestcap_overlays(debug_dir, records, sketch_area):
                 f"sweep_area={int(record['sweep_area'])}, sketch_area={int(sketch_area)}, "
                 f"copy_side_stroke={record.get('copy_side_stroke', -1)}, "
                 f"copy_reason={record.get('copy_reason', 'unknown')}, "
+                f"selected={record.get('selected', False)}, "
+                f"selection_passed={record.get('selection_passed', False)}, "
+                f"selected_by_iou_fallback={record.get('selected_by_iou_fallback', False)}, "
+                f"side={record.get('side_indices', [])}, "
+                f"side_cap_connected={record.get('side_cap_connected_count', 0)}/{record.get('side_cap_side_count', 0)}, "
+                f"side_cap_range_checked={record.get('side_cap_range_checked_count', 0)}, "
+                f"side_cap_range_method={record.get('side_cap_range_method', '')}, "
+                f"side_cap_passed={record.get('side_cap_passed', True)}, "
+                f"side_cap_disconnected={record.get('side_cap_disconnected_strokes', [])}, "
+                f"side_cap_ignored={record.get('side_cap_ignored_disconnected_strokes', [])}, "
                 f"source={record['base']}\n"
             )
+
+        if rejected_records:
+            f.write("\nFiltered rejected candidates, sorted by IoU but not written as rank overlays:\n")
+            for rejected_rank, record in enumerate(sorted(rejected_records, key=lambda r: r["iou"], reverse=True)):
+                f.write(
+                    f"rejected_iou {rejected_rank:02d}: iou={record['iou']:.6f}, "
+                    f"selected={record.get('selected', False)}, "
+                    f"selection_passed={record.get('selection_passed', False)}, "
+                    f"side={record.get('side_indices', [])}, "
+                    f"side_cap_connected={record.get('side_cap_connected_count', 0)}/{record.get('side_cap_side_count', 0)}, "
+                    f"side_cap_range_checked={record.get('side_cap_range_checked_count', 0)}, "
+                    f"side_cap_range_method={record.get('side_cap_range_method', '')}, "
+                    f"side_cap_passed={record.get('side_cap_passed', True)}, "
+                    f"side_cap_disconnected={record.get('side_cap_disconnected_strokes', [])}, "
+                    f"side_cap_ignored={record.get('side_cap_ignored_disconnected_strokes', [])}, "
+                    f"copy_side_stroke={record.get('copy_side_stroke', -1)}, "
+                    f"source={record['base']}\n"
+                )
 
 
 def draw_bbox_from_bestcap_overlay(overlay_img, direction_vector):
@@ -6514,6 +10431,7 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
 
     out_dir = os.path.join(debug_dir, "cluster_side_caps")
     os.makedirs(out_dir, exist_ok=True)
+    clean_ranked_output_dir(out_dir)
     selected_cluster_id = model.get("selected_cluster_id", None)
     successful_parent_ids = successful_direction_parent_ids(model)
     #cap_pool_infos = [s for s in infos if s["arc"] >= args.min_stroke_length]
@@ -6530,7 +10448,7 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
         f.write("When a direction group has no valid cap, remove-k-stroke subgroups are tried level by level until success or one stroke remains.\n")
         f.write("Clusters with n<2 are recorded but do not compute cap.\n")
         f.write("Only direction-group search paths that eventually produced a selectable stopping-round result are emitted here.\n")
-        f.write("Each emitted cluster stores only the largest-area cap candidate.\n\n")
+        f.write("Each emitted cluster stores the best cap after evaluating sweep IoU and side-cap connection gates.\n\n")
 
         for rank, entry in enumerate(cluster_debug):
             details = entry.get("details", {})
@@ -6550,6 +10468,8 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
 
             cap_candidate = None
             skip_reason = ""
+            local_selection_passed = bool(details.get("selection_passed", False))
+            local_connection_info = None
 
             n_strokes = int(details.get("n", len(entry.get("strokes", []))))
 
@@ -6568,7 +10488,20 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
                     thickness=args.cap_loop_thickness,
                     max_loop_subset_size=args.cap_loop_max_subset_size,
                 )
-                cap_candidate = largest_area_cap_candidate(candidates)
+                cap_candidate, _sweep_info, local_connection_info, local_selection_passed, _evaluated = choose_best_cap_candidate_for_selection(
+                    entry,
+                    candidates,
+                    infos,
+                    img_shape,
+                    args.cap_loop_endpoint_tol,
+                    args.cap_loop_thickness,
+                    valid_input_enclosed_mask=sketch_mask if sketch_area > 0 else None,
+                    sweep_gate_enabled=bool(sketch_area > 0 and float(args.cap_sweep_iou_stop_thresh or 0.0) > 0.0),
+                    sweep_iou_stop_thresh=args.cap_sweep_iou_stop_thresh,
+                    copy_direction_angle_tol=args.parallel_angle_thresh,
+                    copy_iou_compare_percent=args.copy_side_iou_compare_percent,
+                    side_cap_connect_tol=args.side_cap_connect_tol,
+                )
                 if cap_candidate is None:
                     skip_reason = "no_legal_cap"
 
@@ -6641,6 +10574,46 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
                         "iou": sweep_iou,
                         "intersection": sweep_intersection,
                         "union": sweep_union,
+                        "selected": bool(selected),
+                        "selection_passed": bool(local_selection_passed),
+                        "selected_by_iou_fallback": bool(details.get("selected_by_iou_fallback", False)),
+                        "cap_validation_fallback_reason": str(
+                            details.get("cap_validation_fallback_reason", "")
+                        ),
+                        "side_indices": list(entry.get("indices", [])),
+                        "side_cap_connected_count": int(
+                            (local_connection_info or {}).get("connected_count", details.get("side_cap_connected_count", 0))
+                        ),
+                        "side_cap_side_count": int(
+                            (local_connection_info or {}).get("side_count", details.get("side_cap_side_count", 0))
+                        ),
+                        "side_cap_range_checked_count": int(
+                            (local_connection_info or {}).get(
+                                "range_checked_count",
+                                details.get("side_cap_range_checked_count", 0),
+                            )
+                        ),
+                        "side_cap_range_method": str(
+                            (local_connection_info or {}).get(
+                                "cap_range_method",
+                                details.get("side_cap_range_method", ""),
+                            )
+                        ),
+                        "side_cap_passed": bool(
+                            (local_connection_info or {}).get("passed", details.get("side_cap_connect_passed", True))
+                        ),
+                        "side_cap_disconnected_strokes": list(
+                            (local_connection_info or {}).get(
+                                "disconnected_strokes",
+                                details.get("side_cap_disconnected_strokes", []),
+                            )
+                        ),
+                        "side_cap_ignored_disconnected_strokes": list(
+                            (local_connection_info or {}).get(
+                                "ignored_disconnected_strokes",
+                                details.get("side_cap_ignored_disconnected_strokes", []),
+                            )
+                        ),
                         "copy_side_stroke": (
                             int(bbox_masks.get("geometry", {}).get("selected_stroke", -1))
                             if bbox_masks is not None
@@ -6677,12 +10650,21 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
                     )
                 f.write(
                     f"rank {rank:02d} cluster {cluster_id:02d} selected={selected} "
+                    f"selection_passed={local_selection_passed} "
                     f"side={entry.get('indices', [])} best_cap_strokes={cap_candidate.get('stroke_indices', [])} "
                     f"best_cap_area={cap_candidate.get('area', 0)} best_cap_enclosed_area={cap_candidate.get('enclosed_area', 0)} "
-                    f"best_cap_bbox_area={cap_candidate.get('bbox_area', 0)} best_cap_bbox={cap_candidate.get('bbox', None)} "
+                f"best_cap_bbox_area={cap_candidate.get('bbox_area', 0)} best_cap_bbox={cap_candidate.get('bbox', None)} "
                     f"best_sweep_iou={float(sweep_iou):.6f} best_sweep_intersection={int(sweep_intersection)} best_sweep_union={int(sweep_union)} best_sweep_area={int(sweep_area)} "
+                    f"side_cap_connected={(local_connection_info or {}).get('connected_count', details.get('side_cap_connected_count', 0))}/{(local_connection_info or {}).get('side_count', details.get('side_cap_side_count', 0))} "
+                    f"side_cap_range_checked={(local_connection_info or {}).get('range_checked_count', details.get('side_cap_range_checked_count', 0))} "
+                    f"side_cap_range_method={(local_connection_info or {}).get('cap_range_method', details.get('side_cap_range_method', ''))} "
+                    f"side_cap_passed={(local_connection_info or {}).get('passed', details.get('side_cap_connect_passed', True))} "
+                    f"side_cap_disconnected={(local_connection_info or {}).get('disconnected_strokes', details.get('side_cap_disconnected_strokes', []))} "
+                    f"side_cap_ignored={(local_connection_info or {}).get('ignored_disconnected_strokes', details.get('side_cap_ignored_disconnected_strokes', []))} "
                     f"best_cap_total_arc={cap_candidate.get('total_arc', 0.0):.1f} "
                     f"best_cap_score={cap_candidate.get('score', 0.0):.1f} "
+                    f"best_cap_topology={cap_candidate.get('topology_kind', '')} "
+                    f"loop_detection={cap_candidate.get('loop_detection', '')} "
                     f"removed_post_loop_self_strokes={cap_candidate.get('removed_post_loop_self_strokes', [])} "
                     f"{copy_side_txt} "
                     f"source={entry.get('source', 'unknown')} parent={entry.get('parent_cluster_id', None)} "
@@ -6691,6 +10673,7 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
             else:
                 f.write(
                     f"rank {rank:02d} cluster {cluster_id:02d} selected={selected} "
+                    f"selection_passed={local_selection_passed} "
                     f"side={entry.get('indices', [])} cap=NONE reason={skip_reason} "
                     f"source={entry.get('source', 'unknown')} parent={entry.get('parent_cluster_id', None)} "
                     f"removed={entry.get('removed_stroke_indices', [])} depth={entry.get('removal_depth', 0)}\n"
@@ -6700,6 +10683,7 @@ def save_per_cluster_side_cap_outputs(debug_dir, img_shape, model, infos, args):
 
 
 def save_debug_report(path, args, raw_strokes, merged_strokes, infos, line_strokes, model, candidates):
+    side_prefilter_strokes = filter_side_direction_group_strokes_for_args(infos, args)
     with open(path, "w", encoding="utf-8") as f:
         f.write("==== Debug Report ====\n\n")
         f.write("Arguments:\n")
@@ -6710,18 +10694,23 @@ def save_debug_report(path, args, raw_strokes, merged_strokes, infos, line_strok
         f.write(f"  merged strokes: {len(merged_strokes)}\n")
         f.write(f"  stroke infos: {len(infos)}\n")
         f.write(f"  line stroke candidates: {len(line_strokes)}\n")
+        f.write(f"  side prefilter candidates: {len(side_prefilter_strokes)}\n")
         f.write(f"  selected side strokes: {len(model['inliers'])}\n")
         f.write(f"  cap candidates: {len(candidates)}\n")
         f.write("\nMerged stroke infos:\n")
         for s in infos:
             c = s["center"]
             dbg = stroke_direction_debug_values(s)
-            f.write(f"  stroke {s['index']:03d}: arc={s['arc']:.1f}, chord={s['chord']:.1f}, straightness={s['straightness']:.3f}, center=({c[0]:.1f},{c[1]:.1f}), pca_axis=({dbg['pca_axis'][0]:.4f},{dbg['pca_axis'][1]:.4f}), pca_angle={dbg['pca_angle']:.2f}\n")
+            f.write(f"  stroke {s['index']:03d}: arc={s['arc']:.1f}, chord={s['chord']:.1f}, straightness={s['straightness']:.3f}, p90_pca_line_error={s.get('p90_pca_line_error', 0.0):.2f}, pca_rms_error={s.get('pca_rms_error', 0.0):.2f}, chord_dev_ratio={s.get('chord_deviation_ratio', 0.0):.4f}, center=({c[0]:.1f},{c[1]:.1f}), pca_axis=({dbg['pca_axis'][0]:.4f},{dbg['pca_axis'][1]:.4f}), pca_angle={dbg['pca_angle']:.2f}\n")
         f.write("\nLine stroke candidates:\n")
         for s in line_strokes:
             c = s["center"]
             dbg = stroke_direction_debug_values(s)
             f.write(f"  stroke {s['index']:03d}: arc={s['arc']:.1f}, straightness={s['straightness']:.3f}, center=({c[0]:.1f},{c[1]:.1f}), pca_axis=({dbg['pca_axis'][0]:.4f},{dbg['pca_axis'][1]:.4f}), pca_angle={dbg['pca_angle']:.2f}\n")
+        f.write("\nSide prefilter candidates used for PCA direction clustering:\n")
+        for s in side_prefilter_strokes:
+            dbg = stroke_direction_debug_values(s)
+            f.write(f"  stroke {s['index']:03d}: arc={s['arc']:.1f}, chord={s['chord']:.1f}, straightness={s['straightness']:.3f}, p90_pca_line_error={s.get('p90_pca_line_error', 0.0):.2f}, pca_rms_error={s.get('pca_rms_error', 0.0):.2f}, chord_dev_ratio={s.get('chord_deviation_ratio', 0.0):.4f}, pca_angle={dbg['pca_angle']:.2f}\n")
         f.write("\nSelected extrusion model:\n")
         f.write(f"  mode: {model['mode']}\n")
         f.write(f"  score: {model['score']:.3f}\n")
@@ -7280,10 +11269,15 @@ def save_stroke_info_debug_outputs(debug_dir, args, img_shape, infos, line_strok
     write_stroke_direction_debug_json(os.path.join(debug_dir, "05a_stroke_directions.json"), infos, line_strokes)
     cv2.imwrite(os.path.join(debug_dir, "05a_stroke_directions.png"), draw_stroke_directions_image(img_shape, infos, line_strokes))
 
-    direction_group_strokes = filter_side_direction_group_strokes(
+    direction_group_strokes = filter_side_direction_group_strokes_for_args(infos, args)
+    write_side_direction_prefilter_report(
+        os.path.join(debug_dir, "05c_side_direction_prefilter.txt"),
         infos,
-        min_length=args.min_stroke_length,
-        min_straightness=args.side_straightness,
+        args,
+    )
+    cv2.imwrite(
+        os.path.join(debug_dir, "05c_side_prefilter_candidates.png"),
+        draw_side_prefilter_candidates_image(img_shape, infos, direction_group_strokes, args=args, thickness=4),
     )
     write_direction_groups_debug_report(
         os.path.join(debug_dir, "05c_all_stroke_direction_groups.txt"),
@@ -7291,6 +11285,7 @@ def save_stroke_info_debug_outputs(debug_dir, args, img_shape, infos, line_strok
         angle_thresh=args.parallel_angle_thresh,
         min_stroke_length=args.min_stroke_length,
         min_straightness=args.side_straightness,
+        args=args,
     )
     cv2.imwrite(
         os.path.join(debug_dir, "05c_all_stroke_direction_groups.png"),
@@ -7359,10 +11354,15 @@ def save_debug_outputs(debug_dir, args, img, bw, skel, pre_post_split_merge_stro
     write_stroke_direction_debug_report(os.path.join(debug_dir, "05a_stroke_directions.txt"), infos, line_strokes)
     write_stroke_direction_debug_json(os.path.join(debug_dir, "05a_stroke_directions.json"), infos, line_strokes)
     cv2.imwrite(os.path.join(debug_dir, "05a_stroke_directions.png"), draw_stroke_directions_image(img.shape, infos, line_strokes))
-    direction_group_strokes = filter_side_direction_group_strokes(
+    direction_group_strokes = filter_side_direction_group_strokes_for_args(infos, args)
+    write_side_direction_prefilter_report(
+        os.path.join(debug_dir, "05c_side_direction_prefilter.txt"),
         infos,
-        min_length=args.min_stroke_length,
-        min_straightness=args.side_straightness,
+        args,
+    )
+    cv2.imwrite(
+        os.path.join(debug_dir, "05c_side_prefilter_candidates.png"),
+        draw_side_prefilter_candidates_image(img.shape, infos, direction_group_strokes, args=args, thickness=4),
     )
     write_direction_groups_debug_report(
         os.path.join(debug_dir, "05c_all_stroke_direction_groups.txt"),
@@ -7370,6 +11370,7 @@ def save_debug_outputs(debug_dir, args, img, bw, skel, pre_post_split_merge_stro
         angle_thresh=args.parallel_angle_thresh,
         min_stroke_length=args.min_stroke_length,
         min_straightness=args.side_straightness,
+        args=args,
     )
     cv2.imwrite(
         os.path.join(debug_dir, "05c_all_stroke_direction_groups.png"),
@@ -7475,6 +11476,42 @@ def main():
         default=0.85,
         help="Hard prefilter for side-stroke clustering. Only strokes with straightness >= this value enter PCA direction grouping for side selection.",
     )
+    parser.add_argument(
+        "--side-min-chord-px",
+        type=float,
+        default=25.0,
+        help="Minimum endpoint chord length for a stroke to enter side PCA direction clustering.",
+    )
+    parser.add_argument(
+        "--side-line-p90-error-px",
+        type=float,
+        default=4.0,
+        help="Absolute p90 distance-to-PCA-line limit for side-stroke clustering. Used with --side-line-p90-error-ratio; <=0 disables the absolute part.",
+    )
+    parser.add_argument(
+        "--side-line-p90-error-ratio",
+        type=float,
+        default=0.035,
+        help="Relative p90 distance-to-PCA-line limit, multiplied by chord length. Used with --side-line-p90-error-px; <=0 disables the ratio part.",
+    )
+    parser.add_argument(
+        "--side-line-rms-error-px",
+        type=float,
+        default=2.5,
+        help="Absolute RMS distance-to-PCA-line limit for side-stroke clustering. Used with --side-line-rms-error-ratio; <=0 disables the absolute part.",
+    )
+    parser.add_argument(
+        "--side-line-rms-error-ratio",
+        type=float,
+        default=0.025,
+        help="Relative RMS distance-to-PCA-line limit, multiplied by chord length. Used with --side-line-rms-error-px; <=0 disables the ratio part.",
+    )
+    parser.add_argument(
+        "--side-chord-dev-ratio-max",
+        type=float,
+        default=0.08,
+        help="Maximum p90 endpoint-chord deviation divided by chord length for side-stroke clustering. <=0 disables this filter.",
+    )
     parser.add_argument("--dist-thresh", type=float, default=8.0)
     parser.add_argument("--angle-thresh", type=float, default=12.0)
     parser.add_argument("--vp", nargs=2, type=float, default=None)
@@ -7496,7 +11533,9 @@ def main():
         ),
     )
 
-    # Cluster-based side selection controls
+    # Cluster-based side selection controls.
+    # Active score uses only count_weight and same_loop_penalty.
+    # Other weight arguments are kept for CLI compatibility and debug experiments, but are ignored.
     parser.add_argument("--cluster-min-perp-spread", type=float, default=10.0)
     parser.add_argument("--same-loop-endpoint-tol", type=float, default=12.0)
     parser.add_argument("--cluster-count-weight", type=float, default=10000)
@@ -7506,7 +11545,7 @@ def main():
     parser.add_argument("--cluster-same-loop-penalty", type=float, default=10000)
     parser.add_argument("--cluster-low-spread-penalty", type=float, default=250.0)
     parser.add_argument("--cluster-length-similarity-weight", type=float, default=10000.0,
-                        help="Reward clusters whose stroke lengths are similar. Score adds weight * (1 / (1 + length_cv)).")
+                        help="Legacy argument retained for compatibility; currently ignored by side-cluster scoring.")
 
     parser.add_argument("--skeleton-gap-tol", type=float, default=0.0,
                         help="Before stroke tracing, connect mutual-nearest skeleton endpoints within this gap tolerance and remove unmatched dangling branches. 0 disables skeleton cleanup.")
@@ -7524,12 +11563,14 @@ def main():
                         help="Reject cap candidates whose total stroke arc length is smaller than this value.")
     parser.add_argument("--cap-sweep-iou-stop-thresh", type=float, default=0.0,
                         help="Only stop cap search when a removal-depth round contains at least one cap whose swept extrusion occupancy IoU against the input enclosed mask is >= this threshold. 0 keeps the old cap-only stopping behavior.")
+    parser.add_argument("--side-cap-connect-tol", type=float, default=20.0,
+                        help="Require every final side stroke to have at least one endpoint within this pixel distance of the selected cap. <=0 disables this gate.")
     parser.add_argument("--cap-loop-endpoint-tol", type=float, default=12.0,
                         help="Endpoint tolerance for deciding whether remaining strokes form a closed cap loop.")
     parser.add_argument("--cap-loop-thickness", type=int, default=2,
                         help="Raster thickness used to draw loop-based cap candidate masks.")
     parser.add_argument("--cap-loop-max-subset-size", type=int, default=14,
-                        help="Deprecated compatibility option. Cap detection now checks whole connected components only; no loop subset enumeration is used.")
+                        help="Search guard for endpoint-port cycle enumeration. The implementation allows longer visible loops when a component is split into many short traced strokes.")
     parser.add_argument("--cap-subgroup-max-removals", type=int, default=-1,
                         help="Max remove-k subgroup depth for direction groups that have no valid cap. Use -1 to continue until one stroke remains.")
 
@@ -7669,6 +11710,8 @@ def main():
         sweep_iou_stop_thresh=args.cap_sweep_iou_stop_thresh,
         copy_direction_angle_tol=args.parallel_angle_thresh,
         copy_iou_compare_percent=args.copy_side_iou_compare_percent,
+        side_cap_connect_tol=args.side_cap_connect_tol,
+        progress_debug_dir=args.debug_dir,
     )
     save_model_debug_outputs(args.debug_dir, img.shape, model, infos, args)
 
