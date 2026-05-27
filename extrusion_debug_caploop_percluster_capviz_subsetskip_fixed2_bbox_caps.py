@@ -5750,6 +5750,7 @@ def validate_side_clusters_by_cap_candidates(
     copy_iou_compare_percent=None,
     side_cap_connect_tol=0.0,
     progress_debug_dir=None,
+    cap_round_workers=1,
 ):
     """
     Compute cap candidates for every direction group.
@@ -5766,6 +5767,11 @@ def validate_side_clusters_by_cap_candidates(
     """
     if model is None:
         return None, []
+
+    try:
+        cap_round_workers = max(1, int(cap_round_workers or 1))
+    except Exception:
+        cap_round_workers = 1
 
     pool_infos = infos if cap_pool_infos is None else cap_pool_infos
     cluster_debug = model.get("cluster_debug", None)
@@ -5852,6 +5858,7 @@ def validate_side_clusters_by_cap_candidates(
         progress_model["cap_sweep_gate_enabled"] = bool(sweep_gate_enabled)
         progress_model["side_cap_connect_enabled"] = bool(float(side_cap_connect_tol or 0.0) > 0.0)
         progress_model["side_cap_connect_tol"] = float(side_cap_connect_tol or 0.0)
+        progress_model["cap_round_workers"] = int(cap_round_workers)
         progress_model["selected_cluster_id"] = (
             None
             if current_winner is None
@@ -6027,7 +6034,7 @@ def validate_side_clusters_by_cap_candidates(
             raise
 
         trace_item = {
-            "order": int(len(cap_search_trace)),
+            "order": -1,
             "rank": int(rank),
             "cluster_id": int(entry.get("cluster_id", -1)),
             "source": entry.get("source", "unknown"),
@@ -6076,7 +6083,6 @@ def validate_side_clusters_by_cap_candidates(
             "cap_found_but_sweep_rejected": bool(details.get("cap_found_but_sweep_rejected", False)),
             "selection_passed": bool(selection_passed),
         }
-        cap_search_trace.append(trace_item)
         return {
             "entry": entry,
             "rank": int(rank),
@@ -6085,6 +6091,38 @@ def validate_side_clusters_by_cap_candidates(
             "selection_passed": bool(selection_passed),
             "trace_item": trace_item,
         }
+
+    def merge_round_trace(round_results):
+        for result in round_results:
+            trace_item = result.get("trace_item", {})
+            trace_item["order"] = int(len(cap_search_trace))
+            cap_search_trace.append(trace_item)
+
+    def evaluate_round(entry_rank_pairs):
+        entry_rank_pairs = list(entry_rank_pairs)
+        if not entry_rank_pairs:
+            return []
+        if cap_round_workers <= 1 or len(entry_rank_pairs) <= 1:
+            results = [evaluate_entry(entry, rank) for entry, rank in entry_rank_pairs]
+            merge_round_trace(results)
+            return results
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        result_by_rank = {}
+        max_workers = min(int(cap_round_workers), len(entry_rank_pairs))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_rank = {
+                executor.submit(evaluate_entry, entry, rank): int(rank)
+                for entry, rank in entry_rank_pairs
+            }
+            for future in as_completed(future_to_rank):
+                result = future.result()
+                result_by_rank[int(result["rank"])] = result
+
+        results = [result_by_rank[int(rank)] for _entry, rank in entry_rank_pairs]
+        merge_round_trace(results)
+        return results
 
     def winner_sort_key(result):
         cap = result.get("best_cap") or {}
@@ -6176,11 +6214,12 @@ def validate_side_clusters_by_cap_candidates(
             return False
         return not any(r.get("selection_passed", False) for r in parent_round_results)
 
-    original_round_results = []
+    original_entry_rank_pairs = []
     for entry in original_cluster_debug:
         rank = len(expanded_cluster_debug)
         expanded_cluster_debug.append(entry)
-        original_round_results.append(evaluate_entry(entry, rank))
+        original_entry_rank_pairs.append((entry, rank))
+    original_round_results = evaluate_round(original_entry_rank_pairs)
 
     record_successful_results(original_round_results)
     record_iou_only_rejected_results(original_round_results)
@@ -6211,14 +6250,15 @@ def validate_side_clusters_by_cap_candidates(
         if selected_result is not None or not failed_original_groups:
             break
 
-        round_results = []
+        round_entry_rank_pairs = []
+        parent_round_pairs = []
         still_failed = []
         for parent_entry in failed_original_groups:
             parent_strokes = list(parent_entry.get("strokes", []))
             if len(parent_strokes) - removal_depth < 1:
                 continue
 
-            parent_round_results = []
+            current_parent_pairs = []
             for removed_positions in itertools.combinations(range(len(parent_strokes)), removal_depth):
                 removed_positions = set(removed_positions)
                 removed_strokes = [s for i, s in enumerate(parent_strokes) if i in removed_positions]
@@ -6234,10 +6274,20 @@ def validate_side_clusters_by_cap_candidates(
 
                 subgroup_rank = len(expanded_cluster_debug)
                 expanded_cluster_debug.append(subgroup)
-                subgroup_result = evaluate_entry(subgroup, subgroup_rank)
-                round_results.append(subgroup_result)
-                parent_round_results.append(subgroup_result)
+                pair = (subgroup, subgroup_rank)
+                round_entry_rank_pairs.append(pair)
+                current_parent_pairs.append(pair)
 
+            parent_round_pairs.append((parent_entry, current_parent_pairs))
+
+        round_results = evaluate_round(round_entry_rank_pairs)
+        result_by_rank = {int(result["rank"]): result for result in round_results}
+        for parent_entry, current_parent_pairs in parent_round_pairs:
+            parent_round_results = [
+                result_by_rank[int(rank)]
+                for _entry, rank in current_parent_pairs
+                if int(rank) in result_by_rank
+            ]
             if parent_unresolved_after_round(parent_entry, parent_round_results, removal_depth):
                 still_failed.append(parent_entry)
 
@@ -6262,6 +6312,7 @@ def validate_side_clusters_by_cap_candidates(
     model["cap_sweep_gate_enabled"] = bool(sweep_gate_enabled)
     model["side_cap_connect_enabled"] = bool(float(side_cap_connect_tol or 0.0) > 0.0)
     model["side_cap_connect_tol"] = float(side_cap_connect_tol or 0.0)
+    model["cap_round_workers"] = int(cap_round_workers)
     model["cap_validation_used_iou_fallback"] = bool(selected_via_iou_fallback)
     model["successful_cap_clusters"] = [
         {
@@ -6320,6 +6371,7 @@ def validate_side_clusters_by_cap_candidates(
     validated_model["cap_sweep_gate_enabled"] = bool(sweep_gate_enabled)
     validated_model["side_cap_connect_enabled"] = bool(float(side_cap_connect_tol or 0.0) > 0.0)
     validated_model["side_cap_connect_tol"] = float(side_cap_connect_tol or 0.0)
+    validated_model["cap_round_workers"] = int(cap_round_workers)
     validated_model["cap_validation_used_iou_fallback"] = bool(selected_via_iou_fallback)
     validated_model["side_cap_connect_passed"] = bool(
         selected_entry.get("details", {}).get("side_cap_connect_passed", True)
@@ -11573,6 +11625,8 @@ def main():
                         help="Search guard for endpoint-port cycle enumeration. The implementation allows longer visible loops when a component is split into many short traced strokes.")
     parser.add_argument("--cap-subgroup-max-removals", type=int, default=-1,
                         help="Max remove-k subgroup depth for direction groups that have no valid cap. Use -1 to continue until one stroke remains.")
+    parser.add_argument("--cap-round-workers", "--cap-round-threads", type=int, default=1,
+                        help="Number of CPU worker threads used to evaluate clusters/subgroups within one cap-search round. 1 keeps serial behavior.")
 
     args = parser.parse_args()
 
@@ -11712,6 +11766,7 @@ def main():
         copy_iou_compare_percent=args.copy_side_iou_compare_percent,
         side_cap_connect_tol=args.side_cap_connect_tol,
         progress_debug_dir=args.debug_dir,
+        cap_round_workers=args.cap_round_workers,
     )
     save_model_debug_outputs(args.debug_dir, img.shape, model, infos, args)
 

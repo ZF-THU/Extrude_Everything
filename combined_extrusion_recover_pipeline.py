@@ -123,6 +123,13 @@ def main():
         default=20.0,
         help="Forwarded to the extrusion script. Require every final side stroke to have an endpoint near the selected cap; <=0 disables this gate.",
     )
+    parser.add_argument(
+        "--cap-round-workers",
+        "--cap-round-threads",
+        type=int,
+        default=1,
+        help="Forwarded to the extrusion script. CPU worker threads for evaluating clusters/subgroups within one cap-search round.",
+    )
     parser.add_argument("--min-cap-total-arc", type=float, default=50)
     parser.add_argument("--split-segment-arc", type=float, default=30)
     parser.add_argument("--split-peak-min-distance", type=float, default=10)
@@ -299,6 +306,8 @@ def main():
             str(args.cap_sweep_iou_stop_thresh),
             "--side-cap-connect-tol",
             str(args.side_cap_connect_tol),
+            "--cap-round-workers",
+            str(args.cap_round_workers),
             "--min-cap-total-arc",
             str(args.min_cap_total_arc),
             "--split-segment-arc",
