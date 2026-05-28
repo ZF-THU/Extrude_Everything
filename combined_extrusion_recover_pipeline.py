@@ -126,6 +126,18 @@ def main():
         help="Forwarded to the extrusion script. Only stop cap search when a removal-depth round contains a cap sweep whose IoU against the input enclosed mask reaches this threshold.",
     )
     parser.add_argument(
+        "--iou-rank-output-thresh",
+        type=float,
+        default=0.6,
+        help="Forwarded to the extrusion script. Write all completed cap-sweep IoU records at or above this threshold to the IoU-ranked overlay directory.",
+    )
+    parser.add_argument(
+        "--cap-search-time-limit-sec",
+        type=float,
+        default=0.0,
+        help="Forwarded to the extrusion script. Soft wall-clock limit for cap subgroup search; 0 disables it.",
+    )
+    parser.add_argument(
         "--side-cap-connect-tol",
         type=float,
         default=20.0,
@@ -318,6 +330,10 @@ def main():
             str(args.min_cap_bbox_area),
             "--cap-sweep-iou-stop-thresh",
             str(args.cap_sweep_iou_stop_thresh),
+            "--iou-rank-output-thresh",
+            str(args.iou_rank_output_thresh),
+            "--cap-search-time-limit-sec",
+            str(args.cap_search_time_limit_sec),
             "--side-cap-connect-tol",
             str(args.side_cap_connect_tol),
             "--cap-round-workers",
