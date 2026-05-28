@@ -3692,6 +3692,7 @@ def extract_planar_face_loop_infos(
     min_abs_area=1.0,
     progress_callback=None,
     progress_context=None,
+    stop_event=None,
 ):
     """
     Extract bounded faces from a stroke-first planar graph.
@@ -3703,6 +3704,14 @@ def extract_planar_face_loop_infos(
     """
     comp = list(map(int, comp))
     context = {} if progress_context is None else dict(progress_context)
+    if cap_search_stop_requested(stop_event):
+        if progress_callback is not None:
+            progress_callback(
+                "planar_face_extraction_cancelled",
+                **context,
+                component_local_indices=comp,
+            )
+        return []
     if progress_callback is not None:
         progress_callback(
             "planar_face_extraction_started",
@@ -3713,6 +3722,14 @@ def extract_planar_face_loop_infos(
         )
 
     graph = build_stroke_first_planar_graph(strokes, comp, endpoint_tol=endpoint_tol)
+    if cap_search_stop_requested(stop_event):
+        if progress_callback is not None:
+            progress_callback(
+                "planar_face_extraction_cancelled",
+                **context,
+                component_local_indices=comp,
+            )
+        return []
     nodes = list(graph.get("nodes", []))
     centers = [np.asarray(c, dtype=np.float64).reshape(2) for c in graph.get("endpoint_centers", [])]
     graph_edges = list(graph.get("edges", []))
@@ -3812,12 +3829,28 @@ def extract_planar_face_loop_infos(
     raw_faces = []
     max_steps = max(1, len(halfedges) + 1)
     for start_id in range(len(halfedges)):
+        if start_id % 32 == 0 and cap_search_stop_requested(stop_event):
+            if progress_callback is not None:
+                progress_callback(
+                    "planar_face_extraction_cancelled",
+                    **context,
+                    raw_face_count=int(len(raw_faces)),
+                )
+            return []
         if start_id in visited:
             continue
         cur = int(start_id)
         face_halfedges = []
         closed = False
         for _step in range(max_steps):
+            if _step % 64 == 0 and cap_search_stop_requested(stop_event):
+                if progress_callback is not None:
+                    progress_callback(
+                        "planar_face_extraction_cancelled",
+                        **context,
+                        raw_face_count=int(len(raw_faces)),
+                    )
+                return []
             if cur in visited:
                 closed = cur == start_id
                 break
@@ -4246,6 +4279,7 @@ def select_full_component_loop_records(
     max_cover_count=12,
     max_records_per_stroke=64,
     max_search_states=200000,
+    stop_event=None,
 ):
     """
     Select only loops that explain the whole normalized component.
@@ -4264,10 +4298,14 @@ def select_full_component_loop_records(
         "missing_component_strokes": sorted(universe),
         "search_states": 0,
         "search_truncated": False,
+        "search_cancelled": False,
         "max_cover_count": int(max_cover_count),
         "max_records_per_stroke": int(max_records_per_stroke),
         "max_search_states": int(max_search_states),
     }
+    if cap_search_stop_requested(stop_event):
+        meta["search_cancelled"] = True
+        return [], meta
     if not universe:
         return [], meta
 
@@ -4335,6 +4373,9 @@ def select_full_component_loop_records(
 
     def dfs(selected, selected_ids, covered):
         nonlocal best_selected, best_objective, search_states, truncated
+        if cap_search_stop_requested(stop_event):
+            meta["search_cancelled"] = True
+            return
         if search_states >= max_search_states:
             truncated = True
             return
@@ -4402,6 +4443,9 @@ def select_full_component_loop_records(
         choices.sort(key=lambda item: item[0])
 
         for _key, rid, record in choices:
+            if cap_search_stop_requested(stop_event):
+                meta["search_cancelled"] = True
+                break
             stroke_set = set(record.get("stroke_set", set()))
             dfs(
                 selected + [record],
@@ -4414,6 +4458,8 @@ def select_full_component_loop_records(
     dfs([], set(), set())
     meta["search_states"] = int(search_states)
     meta["search_truncated"] = bool(truncated)
+    if meta.get("search_cancelled", False):
+        return [], meta
 
     if best_selected is None:
         covered = set()
@@ -4535,6 +4581,7 @@ def extract_cap_loop_candidates_from_strokes(
     thickness=2,
     max_loop_subset_size=14,
     progress_callback=None,
+    stop_event=None,
 ):
     """
     Extract cap candidates from non-side connected components that are closed loops.
@@ -4557,6 +4604,8 @@ def extract_cap_loop_candidates_from_strokes(
     """
     side_ids = {int(s["index"]) for s in side_inliers}
     non_side_infos = [s for s in infos if int(s["index"]) not in side_ids]
+    if cap_search_stop_requested(stop_event):
+        return []
     if progress_callback is not None:
         progress_callback(
             "cap_candidate_extraction_started",
@@ -4595,6 +4644,14 @@ def extract_cap_loop_candidates_from_strokes(
     seen = set()
 
     for component_i, comp in enumerate(comps):
+        if cap_search_stop_requested(stop_event):
+            if progress_callback is not None:
+                progress_callback(
+                    "cap_candidate_extraction_cancelled",
+                    component_index=int(component_i),
+                    candidate_count=int(len(candidates)),
+                )
+            return candidates
         comp = list(map(int, comp))
         if progress_callback is not None:
             progress_callback(
@@ -4728,6 +4785,7 @@ def extract_cap_loop_candidates_from_strokes(
                     "component_index": int(component_i),
                     "component_strokes": component_strokes,
                 },
+                stop_event=stop_event,
             )
             loop_infos.sort(key=lambda item: (
                 -float(item.get("topology", {}).get("abs_area", 0.0)),
@@ -4736,6 +4794,8 @@ def extract_cap_loop_candidates_from_strokes(
             records = []
             processed_loop_count = 0
             for loop_info in loop_infos:
+                if cap_search_stop_requested(stop_event):
+                    break
                 processed_loop_count += 1
                 record = build_cap_record(loop_info)
                 if record is not None:
@@ -4775,6 +4835,7 @@ def extract_cap_loop_candidates_from_strokes(
             component_universe,
             endpoint_tol=endpoint_tol,
             max_cover_count=max(12, len(planar_records)),
+            stop_event=stop_event,
         )
         selection_meta["search_rounds"] = [planar_search_meta]
         if selected_records:
@@ -4881,6 +4942,24 @@ def largest_area_cap_candidate(candidates):
     if not candidates:
         return None
     return max(candidates, key=lambda c: (int(c.get("area", 0)), float(c.get("score", 0.0))))
+
+
+def cap_search_stop_requested(stop_event=None):
+    if stop_event is None:
+        return False
+    try:
+        return bool(stop_event.is_set())
+    except Exception:
+        return False
+
+
+def cap_search_request_stop(stop_event=None):
+    if stop_event is None:
+        return
+    try:
+        stop_event.set()
+    except Exception:
+        pass
 
 
 def cluster_entry_index_set(entry):
@@ -5555,14 +5634,22 @@ def compute_best_cap_for_side_entry(
     cap_pool_infos=None,
     progress_debug_dir=None,
     progress_rank=None,
+    stop_event=None,
 ):
     """Try one direction group as side strokes and return its largest-area cap."""
     pool_infos = infos if cap_pool_infos is None else cap_pool_infos
 
     def progress(event, **payload):
-        if progress_debug_dir is None or progress_rank is None:
+        if (
+            progress_debug_dir is None
+            or progress_rank is None
+            or cap_search_stop_requested(stop_event)
+        ):
             return
         write_cluster_cap_search_step(progress_debug_dir, entry, progress_rank, event, **payload)
+
+    if cap_search_stop_requested(stop_event):
+        return None, []
 
     progress(
         "compute_best_cap_for_side_entry_started",
@@ -5587,7 +5674,10 @@ def compute_best_cap_for_side_entry(
         thickness=thickness,
         max_loop_subset_size=max_loop_subset_size,
         progress_callback=progress if progress_debug_dir is not None and progress_rank is not None else None,
+        stop_event=stop_event,
     )
+    if cap_search_stop_requested(stop_event):
+        return None, []
     best = largest_area_cap_candidate(candidates)
     progress(
         "compute_best_cap_for_side_entry_finished",
@@ -5611,8 +5701,16 @@ def evaluate_cap_candidate_for_selection(
     copy_iou_compare_percent=None,
     side_cap_connect_tol=0.0,
     progress_debug_dir=None,
+    stop_event=None,
 ):
     """Evaluate one cap candidate with sweep IoU and side-cap connection gates."""
+    if cap_search_stop_requested(stop_event):
+        return {
+            "cap_candidate": cap_candidate,
+            "sweep_info": None,
+            "connection_info": None,
+            "selection_passed": False,
+        }
     sweep_info = None
     if cap_candidate is not None and valid_input_enclosed_mask is not None:
         sweep_info = compute_cap_sweep_similarity(
@@ -5666,13 +5764,17 @@ def choose_best_cap_candidate_for_selection(
     copy_iou_compare_percent=None,
     side_cap_connect_tol=0.0,
     progress_debug_dir=None,
+    stop_event=None,
 ):
     """Choose the best cap candidate after evaluating every candidate's IoU."""
-    if not candidates:
+    if not candidates or cap_search_stop_requested(stop_event):
         return None, None, None, False, []
 
-    evaluated = [
-        evaluate_cap_candidate_for_selection(
+    evaluated = []
+    for cap_candidate in candidates:
+        if cap_search_stop_requested(stop_event):
+            break
+        evaluated.append(evaluate_cap_candidate_for_selection(
             entry,
             cap_candidate,
             infos,
@@ -5685,9 +5787,10 @@ def choose_best_cap_candidate_for_selection(
             copy_direction_angle_tol=copy_direction_angle_tol,
             copy_iou_compare_percent=copy_iou_compare_percent,
             side_cap_connect_tol=side_cap_connect_tol,
-        )
-        for cap_candidate in candidates
-    ]
+            stop_event=stop_event,
+        ))
+    if not evaluated:
+        return None, None, None, False, []
 
     def sort_key(item):
         cap = item.get("cap_candidate") or {}
@@ -5731,6 +5834,327 @@ def is_iou_only_rejected_result(result, *, sweep_gate_enabled=False, sweep_iou_s
     return True
 
 
+def evaluate_cap_cluster_entry_worker(payload):
+    """Pickle-friendly wrapper used by ProcessPoolExecutor."""
+    if payload.get("limit_cv_threads", False):
+        try:
+            cv2.setNumThreads(1)
+        except Exception:
+            pass
+    return evaluate_cap_cluster_entry(**payload)
+
+
+def evaluate_cap_cluster_entry(
+    entry,
+    rank,
+    infos,
+    image_shape,
+    endpoint_tol=12.0,
+    min_pixels=40,
+    min_enclosed_area=0,
+    min_bbox_area=0,
+    min_total_arc=0.0,
+    thickness=2,
+    max_loop_subset_size=14,
+    pool_infos=None,
+    progress_debug_dir=None,
+    valid_input_enclosed_mask=None,
+    sweep_gate_enabled=False,
+    sweep_iou_stop_thresh=0.0,
+    copy_direction_angle_tol=None,
+    copy_iou_compare_percent=None,
+    side_cap_connect_tol=0.0,
+    stop_event=None,
+    limit_cv_threads=False,
+):
+    """Evaluate one side cluster/subgroup and return its cap-search result."""
+    if limit_cv_threads:
+        try:
+            cv2.setNumThreads(1)
+        except Exception:
+            pass
+
+    details = init_cap_validation_details(entry, rank)
+    details["sweep_gate_enabled"] = bool(sweep_gate_enabled)
+    n_strokes = int(details.get("n", len(entry.get("strokes", []))))
+    best_cap = None
+    sweep_info = None
+    connection_info = None
+    trial_candidates = []
+    cap_evaluations = []
+    selection_passed = False
+    cancelled = False
+
+    def stopped():
+        return cap_search_stop_requested(stop_event)
+
+    def mark_cancelled(phase):
+        nonlocal cancelled, selection_passed
+        cancelled = True
+        selection_passed = False
+        details["cap_validation_cancelled"] = True
+        details["cap_validation_cancel_phase"] = str(phase)
+        details["cap_validation_selectable"] = False
+        details["selection_passed"] = False
+
+    try:
+        if stopped():
+            mark_cancelled("before_started")
+        else:
+            write_cluster_progress_status(
+                progress_debug_dir,
+                entry,
+                rank,
+                "started",
+                selection_passed=False,
+                sweep_gate_enabled=bool(sweep_gate_enabled),
+                sweep_iou_stop_thresh=float(sweep_iou_stop_thresh or 0.0),
+                side_cap_connect_tol=float(side_cap_connect_tol or 0.0),
+            )
+
+        if not cancelled and stopped():
+            mark_cancelled("after_started")
+
+        if not cancelled:
+            save_cluster_progress_preview_outputs(
+                progress_debug_dir,
+                image_shape,
+                entry,
+                rank,
+                infos,
+                pool_infos,
+                endpoint_tol,
+                stop_event=stop_event,
+            )
+
+        if not cancelled and stopped():
+            mark_cancelled("after_preview")
+
+        if not cancelled:
+            if n_strokes < 2:
+                details["cap_validation_skipped"] = True
+                details["cap_validation_skip_reason"] = "n_lt_2"
+                details["cap_validation_selectable"] = False
+                if not stopped():
+                    write_cluster_progress_status(
+                        progress_debug_dir,
+                        entry,
+                        rank,
+                        "skipped_n_lt_2",
+                        selection_passed=False,
+                    )
+            else:
+                details["cap_validation_checked"] = True
+                if not stopped():
+                    write_cluster_progress_status(
+                        progress_debug_dir,
+                        entry,
+                        rank,
+                        "searching_cap_candidates",
+                        selection_passed=False,
+                    )
+                if stopped():
+                    mark_cancelled("before_cap_search")
+                else:
+                    largest_cap_preview, trial_candidates = compute_best_cap_for_side_entry(
+                        entry,
+                        infos,
+                        image_shape,
+                        endpoint_tol=endpoint_tol,
+                        min_pixels=min_pixels,
+                        min_enclosed_area=min_enclosed_area,
+                        min_bbox_area=min_bbox_area,
+                        min_total_arc=min_total_arc,
+                        thickness=thickness,
+                        max_loop_subset_size=max_loop_subset_size,
+                        cap_pool_infos=pool_infos,
+                        progress_debug_dir=progress_debug_dir,
+                        progress_rank=rank,
+                        stop_event=stop_event,
+                    )
+                    if stopped():
+                        mark_cancelled("after_cap_search")
+                    else:
+                        write_cluster_progress_status(
+                            progress_debug_dir,
+                            entry,
+                            rank,
+                            "evaluating_cap_candidates",
+                            selection_passed=False,
+                            cap_candidate_count=int(len(trial_candidates)),
+                            best_cap_preview=summarize_cap_candidate_for_status(largest_cap_preview),
+                        )
+                        best_cap, sweep_info, connection_info, selection_passed, cap_evaluations = choose_best_cap_candidate_for_selection(
+                            entry,
+                            trial_candidates,
+                            infos,
+                            image_shape,
+                            endpoint_tol,
+                            thickness,
+                            valid_input_enclosed_mask=valid_input_enclosed_mask,
+                            sweep_gate_enabled=sweep_gate_enabled,
+                            sweep_iou_stop_thresh=sweep_iou_stop_thresh,
+                            copy_direction_angle_tol=copy_direction_angle_tol,
+                            copy_iou_compare_percent=copy_iou_compare_percent,
+                            side_cap_connect_tol=side_cap_connect_tol,
+                            stop_event=stop_event,
+                        )
+                        if stopped():
+                            mark_cancelled("after_candidate_evaluation")
+                        else:
+                            details["cap_candidate_evaluated_count"] = int(len(cap_evaluations))
+                            fill_best_cap_details(details, best_cap, len(trial_candidates))
+                            fill_best_cap_sweep_details(
+                                details,
+                                sweep_info,
+                                gate_enabled=sweep_gate_enabled,
+                                stop_thresh=sweep_iou_stop_thresh,
+                            )
+                            if connection_info is not None:
+                                fill_side_cap_connection_details(details, connection_info)
+
+        if not cancelled and best_cap is not None:
+            if sweep_gate_enabled:
+                details["cap_found_but_sweep_rejected"] = not bool(details.get("best_sweep_passed", False))
+            if connection_info is not None:
+                details["cap_found_but_side_cap_disconnected"] = not bool(connection_info.get("passed", True))
+        if not cancelled:
+            details["selection_passed"] = bool(selection_passed)
+            details["cap_validation_selectable"] = bool(selection_passed)
+
+        if not cancelled and stopped():
+            mark_cancelled("before_debug_outputs")
+
+        if not cancelled:
+            write_cluster_progress_status(
+                progress_debug_dir,
+                entry,
+                rank,
+                "writing_debug_outputs",
+                selection_passed=bool(selection_passed),
+                cap_candidate_count=int(len(trial_candidates)),
+                cap_candidate_evaluated_count=int(len(cap_evaluations)),
+                best_cap=summarize_cap_candidate_for_status(best_cap),
+                best_sweep_iou=0.0 if sweep_info is None else float(sweep_info.get("iou", 0.0)),
+                best_sweep_valid=False if sweep_info is None else bool(sweep_info.get("valid", False)),
+                side_cap_passed=True if connection_info is None else bool(connection_info.get("passed", True)),
+            )
+
+            save_single_cluster_candidate_debug_output(
+                progress_debug_dir,
+                image_shape,
+                entry,
+                rank,
+                infos,
+                pool_infos,
+                best_cap,
+                cap_evaluations,
+                endpoint_tol,
+                thickness,
+                valid_input_enclosed_mask=valid_input_enclosed_mask,
+                sweep_gate_enabled=sweep_gate_enabled,
+                sweep_iou_stop_thresh=sweep_iou_stop_thresh,
+                copy_direction_angle_tol=copy_direction_angle_tol,
+                copy_iou_compare_percent=copy_iou_compare_percent,
+                stop_event=stop_event,
+            )
+
+        if not cancelled and stopped():
+            mark_cancelled("after_debug_outputs")
+
+        if not cancelled:
+            write_cluster_progress_status(
+                progress_debug_dir,
+                entry,
+                rank,
+                "completed",
+                selection_passed=bool(selection_passed),
+                cap_candidate_count=int(len(trial_candidates)),
+                cap_candidate_evaluated_count=int(len(cap_evaluations)),
+                best_cap=summarize_cap_candidate_for_status(best_cap),
+                best_sweep_iou=0.0 if sweep_info is None else float(sweep_info.get("iou", 0.0)),
+                best_sweep_valid=False if sweep_info is None else bool(sweep_info.get("valid", False)),
+                side_cap_passed=True if connection_info is None else bool(connection_info.get("passed", True)),
+                side_cap_connected_count=0 if connection_info is None else int(connection_info.get("connected_count", 0)),
+                side_cap_side_count=0 if connection_info is None else int(connection_info.get("side_count", 0)),
+            )
+    except Exception as exc:
+        if not stopped():
+            write_cluster_progress_status(
+                progress_debug_dir,
+                entry,
+                rank,
+                "failed",
+                selection_passed=False,
+                error=str(exc),
+                cap_candidate_count=int(len(trial_candidates)),
+                cap_candidate_evaluated_count=int(len(cap_evaluations)),
+            )
+        raise
+
+    trace_item = {
+        "order": -1,
+        "rank": int(rank),
+        "cluster_id": int(entry.get("cluster_id", -1)),
+        "source": entry.get("source", "unknown"),
+        "parent_cluster_id": entry.get("parent_cluster_id", None),
+        "removal_depth": int(entry.get("removal_depth", 0)),
+        "removed_stroke_indices": list(entry.get("removed_stroke_indices", [])),
+        "side_indices": [int(s["index"]) for s in entry.get("strokes", [])],
+        "n": int(n_strokes),
+        "checked": bool(details.get("cap_validation_checked", False)),
+        "skipped": bool(details.get("cap_validation_skipped", False)),
+        "skip_reason": details.get("cap_validation_skip_reason", ""),
+        "cancelled": bool(cancelled or details.get("cap_validation_cancelled", False)),
+        "cancel_phase": details.get("cap_validation_cancel_phase", ""),
+        "cap_found": best_cap is not None,
+        "cap_candidate_count": int(details.get("cap_candidate_count", 0)),
+        "cap_candidate_evaluated_count": int(details.get("cap_candidate_evaluated_count", 0)),
+        "best_cap_area": int(details.get("best_cap_area", 0)),
+        "best_cap_enclosed_area": int(details.get("best_cap_enclosed_area", 0)),
+        "best_cap_bbox_area": int(details.get("best_cap_bbox_area", 0)),
+        "best_cap_total_arc": float(details.get("best_cap_total_arc", 0.0)),
+        "best_cap_score": float(details.get("best_cap_score", 0.0)),
+        "best_cap_strokes": list(details.get("best_cap_strokes", [])),
+        "best_cap_topology_kind": details.get("best_cap_topology_kind", ""),
+        "best_cap_loop_detection": details.get("best_cap_loop_detection", ""),
+        "best_cap_topology_cycle_count": int(details.get("best_cap_topology_cycle_count", 0)),
+        "best_cap_topology_simple_cycle_count": int(details.get("best_cap_topology_simple_cycle_count", 0)),
+        "best_cap_topology_edge_disjoint_cover": bool(details.get("best_cap_topology_edge_disjoint_cover", False)),
+        "best_cap_topology_edge_disjoint_cover_count": int(details.get("best_cap_topology_edge_disjoint_cover_count", 0)),
+        "best_sweep_valid": bool(details.get("best_sweep_valid", False)),
+        "best_sweep_iou": float(details.get("best_sweep_iou", 0.0)),
+        "best_sweep_intersection": int(details.get("best_sweep_intersection", 0)),
+        "best_sweep_union": int(details.get("best_sweep_union", 0)),
+        "best_sweep_area": int(details.get("best_sweep_area", 0)),
+        "best_sweep_copy_side_stroke": details.get("best_sweep_copy_side_stroke", None),
+        "best_sweep_copy_reason": details.get("best_sweep_copy_reason", ""),
+        "best_sweep_mask_source": details.get("best_sweep_mask_source", ""),
+        "side_cap_connect_enabled": bool(details.get("side_cap_connect_enabled", False)),
+        "side_cap_connect_tol": float(details.get("side_cap_connect_tol", 0.0)),
+        "side_cap_connect_passed": bool(details.get("side_cap_connect_passed", True)),
+        "side_cap_connected_count": int(details.get("side_cap_connected_count", 0)),
+        "side_cap_side_count": int(details.get("side_cap_side_count", 0)),
+        "side_cap_range_checked_count": int(details.get("side_cap_range_checked_count", 0)),
+        "side_cap_disconnected_strokes": list(details.get("side_cap_disconnected_strokes", [])),
+        "side_cap_ignored_disconnected_strokes": list(details.get("side_cap_ignored_disconnected_strokes", [])),
+        "side_cap_range_method": details.get("side_cap_range_method", ""),
+        "side_cap_connection_details": list(details.get("side_cap_connection_details", [])),
+        "cap_found_but_side_cap_disconnected": bool(details.get("cap_found_but_side_cap_disconnected", False)),
+        "cap_found_but_sweep_rejected": bool(details.get("cap_found_but_sweep_rejected", False)),
+        "selection_passed": bool(selection_passed),
+    }
+    return {
+        "entry": entry,
+        "rank": int(rank),
+        "best_cap": best_cap,
+        "trial_candidates": [],
+        "selection_passed": bool(selection_passed),
+        "cancelled": bool(cancelled),
+        "trace_item": trace_item,
+    }
+
+
 def validate_side_clusters_by_cap_candidates(
     model,
     infos,
@@ -5751,11 +6175,13 @@ def validate_side_clusters_by_cap_candidates(
     side_cap_connect_tol=0.0,
     progress_debug_dir=None,
     cap_round_workers=1,
+    cap_worker_backend="thread",
 ):
     """
     Compute cap candidates for every direction group.
 
-    Search is executed round by round.
+    With cap_round_workers=1, search is executed round by round.
+    With cap_round_workers>1, search uses pipelined speculative scheduling.
 
     Round 0 evaluates all full direction groups.
     Round k evaluates all remove-k subgroups for every still-unresolved parent.
@@ -5772,6 +6198,9 @@ def validate_side_clusters_by_cap_candidates(
         cap_round_workers = max(1, int(cap_round_workers or 1))
     except Exception:
         cap_round_workers = 1
+    cap_worker_backend = str(cap_worker_backend or "thread").strip().lower()
+    if cap_worker_backend not in {"thread", "process"}:
+        cap_worker_backend = "thread"
 
     pool_infos = infos if cap_pool_infos is None else cap_pool_infos
     cluster_debug = model.get("cluster_debug", None)
@@ -5830,6 +6259,8 @@ def validate_side_clusters_by_cap_candidates(
         model["side_cap_range_method"] = connection_info.get("cap_range_method", "")
         model["cap_validated"] = bool(selection_passed)
         model["cap_validation_failed"] = not bool(selection_passed)
+        model["cap_worker_backend"] = cap_worker_backend
+        model["cap_round_workers"] = int(cap_round_workers)
         if sweep_info is not None:
             model["best_sweep_iou"] = float(sweep_info.get("iou", 0.0))
             model["best_sweep_valid"] = bool(sweep_info.get("valid", False))
@@ -5859,6 +6290,7 @@ def validate_side_clusters_by_cap_candidates(
         progress_model["side_cap_connect_enabled"] = bool(float(side_cap_connect_tol or 0.0) > 0.0)
         progress_model["side_cap_connect_tol"] = float(side_cap_connect_tol or 0.0)
         progress_model["cap_round_workers"] = int(cap_round_workers)
+        progress_model["cap_worker_backend"] = cap_worker_backend
         progress_model["selected_cluster_id"] = (
             None
             if current_winner is None
@@ -5866,231 +6298,42 @@ def validate_side_clusters_by_cap_candidates(
         )
         save_cluster_debug_outputs(progress_debug_dir, image_shape, progress_model)
 
-    def evaluate_entry(entry, rank):
-        details = init_cap_validation_details(entry, rank)
-        details["sweep_gate_enabled"] = bool(sweep_gate_enabled)
-        n_strokes = int(details.get("n", len(entry.get("strokes", []))))
-        best_cap = None
-        sweep_info = None
-        connection_info = None
-        trial_candidates = []
-        cap_evaluations = []
-        selection_passed = False
-        write_cluster_progress_status(
-            progress_debug_dir,
-            entry,
-            rank,
-            "started",
-            selection_passed=False,
-            sweep_gate_enabled=bool(sweep_gate_enabled),
-            sweep_iou_stop_thresh=float(sweep_iou_stop_thresh or 0.0),
-            side_cap_connect_tol=float(side_cap_connect_tol or 0.0),
-        )
-        save_cluster_progress_preview_outputs(
-            progress_debug_dir,
-            image_shape,
-            entry,
-            rank,
-            infos,
-            pool_infos,
-            endpoint_tol,
-        )
-        try:
-            if n_strokes < 2:
-                details["cap_validation_skipped"] = True
-                details["cap_validation_skip_reason"] = "n_lt_2"
-                details["cap_validation_selectable"] = False
-                write_cluster_progress_status(
-                    progress_debug_dir,
-                    entry,
-                    rank,
-                    "skipped_n_lt_2",
-                    selection_passed=False,
-                )
-            else:
-                details["cap_validation_checked"] = True
-                write_cluster_progress_status(
-                    progress_debug_dir,
-                    entry,
-                    rank,
-                    "searching_cap_candidates",
-                    selection_passed=False,
-                )
-                largest_cap_preview, trial_candidates = compute_best_cap_for_side_entry(
-                    entry,
-                    infos,
-                    image_shape,
-                    endpoint_tol=endpoint_tol,
-                    min_pixels=min_pixels,
-                    min_enclosed_area=min_enclosed_area,
-                    min_bbox_area=min_bbox_area,
-                    min_total_arc=min_total_arc,
-                    thickness=thickness,
-                    max_loop_subset_size=max_loop_subset_size,
-                    cap_pool_infos=pool_infos,
-                    progress_debug_dir=progress_debug_dir,
-                    progress_rank=rank,
-                )
-                write_cluster_progress_status(
-                    progress_debug_dir,
-                    entry,
-                    rank,
-                    "evaluating_cap_candidates",
-                    selection_passed=False,
-                    cap_candidate_count=int(len(trial_candidates)),
-                    best_cap_preview=summarize_cap_candidate_for_status(largest_cap_preview),
-                )
-                best_cap, sweep_info, connection_info, selection_passed, cap_evaluations = choose_best_cap_candidate_for_selection(
-                    entry,
-                    trial_candidates,
-                    infos,
-                    image_shape,
-                    endpoint_tol,
-                    thickness,
-                    valid_input_enclosed_mask=valid_input_enclosed_mask,
-                    sweep_gate_enabled=sweep_gate_enabled,
-                    sweep_iou_stop_thresh=sweep_iou_stop_thresh,
-                    copy_direction_angle_tol=copy_direction_angle_tol,
-                    copy_iou_compare_percent=copy_iou_compare_percent,
-                    side_cap_connect_tol=side_cap_connect_tol,
-                )
-                details["cap_candidate_evaluated_count"] = int(len(cap_evaluations))
-                fill_best_cap_details(details, best_cap, len(trial_candidates))
-                fill_best_cap_sweep_details(
-                    details,
-                    sweep_info,
-                    gate_enabled=sweep_gate_enabled,
-                    stop_thresh=sweep_iou_stop_thresh,
-                )
-                if connection_info is not None:
-                    fill_side_cap_connection_details(details, connection_info)
+    cap_stop_event = None
 
-            if best_cap is not None:
-                if sweep_gate_enabled:
-                    details["cap_found_but_sweep_rejected"] = not bool(details.get("best_sweep_passed", False))
-                if connection_info is not None:
-                    details["cap_found_but_side_cap_disconnected"] = not bool(connection_info.get("passed", True))
-            details["selection_passed"] = bool(selection_passed)
-            details["cap_validation_selectable"] = bool(selection_passed)
-
-            write_cluster_progress_status(
-                progress_debug_dir,
-                entry,
-                rank,
-                "writing_debug_outputs",
-                selection_passed=bool(selection_passed),
-                cap_candidate_count=int(len(trial_candidates)),
-                cap_candidate_evaluated_count=int(len(cap_evaluations)),
-                best_cap=summarize_cap_candidate_for_status(best_cap),
-                best_sweep_iou=0.0 if sweep_info is None else float(sweep_info.get("iou", 0.0)),
-                best_sweep_valid=False if sweep_info is None else bool(sweep_info.get("valid", False)),
-                side_cap_passed=True if connection_info is None else bool(connection_info.get("passed", True)),
-            )
-
-            save_single_cluster_candidate_debug_output(
-                progress_debug_dir,
-                image_shape,
-                entry,
-                rank,
-                infos,
-                pool_infos,
-                best_cap,
-                cap_evaluations,
-                endpoint_tol,
-                thickness,
-                valid_input_enclosed_mask=valid_input_enclosed_mask,
-                sweep_gate_enabled=sweep_gate_enabled,
-                sweep_iou_stop_thresh=sweep_iou_stop_thresh,
-                copy_direction_angle_tol=copy_direction_angle_tol,
-                copy_iou_compare_percent=copy_iou_compare_percent,
-            )
-
-            write_cluster_progress_status(
-                progress_debug_dir,
-                entry,
-                rank,
-                "completed",
-                selection_passed=bool(selection_passed),
-                cap_candidate_count=int(len(trial_candidates)),
-                cap_candidate_evaluated_count=int(len(cap_evaluations)),
-                best_cap=summarize_cap_candidate_for_status(best_cap),
-                best_sweep_iou=0.0 if sweep_info is None else float(sweep_info.get("iou", 0.0)),
-                best_sweep_valid=False if sweep_info is None else bool(sweep_info.get("valid", False)),
-                side_cap_passed=True if connection_info is None else bool(connection_info.get("passed", True)),
-                side_cap_connected_count=0 if connection_info is None else int(connection_info.get("connected_count", 0)),
-                side_cap_side_count=0 if connection_info is None else int(connection_info.get("side_count", 0)),
-            )
-        except Exception as exc:
-            write_cluster_progress_status(
-                progress_debug_dir,
-                entry,
-                rank,
-                "failed",
-                selection_passed=False,
-                error=str(exc),
-                cap_candidate_count=int(len(trial_candidates)),
-                cap_candidate_evaluated_count=int(len(cap_evaluations)),
-            )
-            raise
-
-        trace_item = {
-            "order": -1,
-            "rank": int(rank),
-            "cluster_id": int(entry.get("cluster_id", -1)),
-            "source": entry.get("source", "unknown"),
-            "parent_cluster_id": entry.get("parent_cluster_id", None),
-            "removal_depth": int(entry.get("removal_depth", 0)),
-            "removed_stroke_indices": list(entry.get("removed_stroke_indices", [])),
-            "side_indices": [int(s["index"]) for s in entry.get("strokes", [])],
-            "n": int(n_strokes),
-            "checked": bool(details.get("cap_validation_checked", False)),
-            "skipped": bool(details.get("cap_validation_skipped", False)),
-            "skip_reason": details.get("cap_validation_skip_reason", ""),
-            "cap_found": best_cap is not None,
-            "cap_candidate_count": int(details.get("cap_candidate_count", 0)),
-            "cap_candidate_evaluated_count": int(details.get("cap_candidate_evaluated_count", 0)),
-            "best_cap_area": int(details.get("best_cap_area", 0)),
-            "best_cap_enclosed_area": int(details.get("best_cap_enclosed_area", 0)),
-            "best_cap_bbox_area": int(details.get("best_cap_bbox_area", 0)),
-            "best_cap_total_arc": float(details.get("best_cap_total_arc", 0.0)),
-            "best_cap_score": float(details.get("best_cap_score", 0.0)),
-            "best_cap_strokes": list(details.get("best_cap_strokes", [])),
-            "best_cap_topology_kind": details.get("best_cap_topology_kind", ""),
-            "best_cap_loop_detection": details.get("best_cap_loop_detection", ""),
-            "best_cap_topology_cycle_count": int(details.get("best_cap_topology_cycle_count", 0)),
-            "best_cap_topology_simple_cycle_count": int(details.get("best_cap_topology_simple_cycle_count", 0)),
-            "best_cap_topology_edge_disjoint_cover": bool(details.get("best_cap_topology_edge_disjoint_cover", False)),
-            "best_cap_topology_edge_disjoint_cover_count": int(details.get("best_cap_topology_edge_disjoint_cover_count", 0)),
-            "best_sweep_valid": bool(details.get("best_sweep_valid", False)),
-            "best_sweep_iou": float(details.get("best_sweep_iou", 0.0)),
-            "best_sweep_intersection": int(details.get("best_sweep_intersection", 0)),
-            "best_sweep_union": int(details.get("best_sweep_union", 0)),
-            "best_sweep_area": int(details.get("best_sweep_area", 0)),
-            "best_sweep_copy_side_stroke": details.get("best_sweep_copy_side_stroke", None),
-            "best_sweep_copy_reason": details.get("best_sweep_copy_reason", ""),
-            "best_sweep_mask_source": details.get("best_sweep_mask_source", ""),
-            "side_cap_connect_enabled": bool(details.get("side_cap_connect_enabled", False)),
-            "side_cap_connect_tol": float(details.get("side_cap_connect_tol", 0.0)),
-            "side_cap_connect_passed": bool(details.get("side_cap_connect_passed", True)),
-            "side_cap_connected_count": int(details.get("side_cap_connected_count", 0)),
-            "side_cap_side_count": int(details.get("side_cap_side_count", 0)),
-            "side_cap_range_checked_count": int(details.get("side_cap_range_checked_count", 0)),
-            "side_cap_disconnected_strokes": list(details.get("side_cap_disconnected_strokes", [])),
-            "side_cap_ignored_disconnected_strokes": list(details.get("side_cap_ignored_disconnected_strokes", [])),
-            "side_cap_range_method": details.get("side_cap_range_method", ""),
-            "side_cap_connection_details": list(details.get("side_cap_connection_details", [])),
-            "cap_found_but_side_cap_disconnected": bool(details.get("cap_found_but_side_cap_disconnected", False)),
-            "cap_found_but_sweep_rejected": bool(details.get("cap_found_but_sweep_rejected", False)),
-            "selection_passed": bool(selection_passed),
-        }
+    def build_entry_eval_payload(entry, rank, limit_cv_threads=False):
         return {
             "entry": entry,
             "rank": int(rank),
-            "best_cap": best_cap,
-            "trial_candidates": trial_candidates,
-            "selection_passed": bool(selection_passed),
-            "trace_item": trace_item,
+            "infos": infos,
+            "image_shape": image_shape,
+            "endpoint_tol": endpoint_tol,
+            "min_pixels": min_pixels,
+            "min_enclosed_area": min_enclosed_area,
+            "min_bbox_area": min_bbox_area,
+            "min_total_arc": min_total_arc,
+            "thickness": thickness,
+            "max_loop_subset_size": max_loop_subset_size,
+            "pool_infos": pool_infos,
+            "progress_debug_dir": progress_debug_dir,
+            "valid_input_enclosed_mask": valid_input_enclosed_mask,
+            "sweep_gate_enabled": sweep_gate_enabled,
+            "sweep_iou_stop_thresh": sweep_iou_stop_thresh,
+            "copy_direction_angle_tol": copy_direction_angle_tol,
+            "copy_iou_compare_percent": copy_iou_compare_percent,
+            "side_cap_connect_tol": side_cap_connect_tol,
+            "stop_event": cap_stop_event,
+            "limit_cv_threads": bool(limit_cv_threads),
         }
+
+    def merge_result_entry(result):
+        rank = int(result.get("rank", -1))
+        if 0 <= rank < len(expanded_cluster_debug):
+            expanded_cluster_debug[rank] = result.get("entry", expanded_cluster_debug[rank])
+
+    def evaluate_entry(entry, rank):
+        result = evaluate_cap_cluster_entry(**build_entry_eval_payload(entry, rank))
+        merge_result_entry(result)
+        return result
 
     def merge_round_trace(round_results):
         for result in round_results:
@@ -6214,52 +6457,103 @@ def validate_side_clusters_by_cap_candidates(
             return False
         return not any(r.get("selection_passed", False) for r in parent_round_results)
 
-    original_entry_rank_pairs = []
-    for entry in original_cluster_debug:
-        rank = len(expanded_cluster_debug)
-        expanded_cluster_debug.append(entry)
-        original_entry_rank_pairs.append((entry, rank))
-    original_round_results = evaluate_round(original_entry_rank_pairs)
-
-    record_successful_results(original_round_results)
-    record_iou_only_rejected_results(original_round_results)
-    selected_result = choose_round_winner(original_round_results)
-    summarize_round(0, original_round_results, selected_result)
-    flush_round_progress(selected_result)
-
-    failed_original_groups = []
-    if selected_result is None:
-        for result in original_round_results:
-            entry = result["entry"]
-            if len(entry.get("strokes", [])) <= 1:
-                continue
-            if not result.get("selection_passed", False):
-                failed_original_groups.append(entry)
-
     import itertools
 
-    max_possible_removals = 0
-    if failed_original_groups:
-        max_possible_removals = max(len(entry.get("strokes", [])) - 1 for entry in failed_original_groups)
-    if max_subgroup_removals is None or int(max_subgroup_removals) < 0:
-        max_subgroup_removals = max_possible_removals
-    else:
-        max_subgroup_removals = min(max_possible_removals, max(0, int(max_subgroup_removals)))
+    def run_pipelined_cluster_search():
+        """
+        Keep workers full by scheduling the next subgroup depth for each
+        parent as soon as that parent's current depth finishes without a pass.
 
-    for removal_depth in range(1, max_subgroup_removals + 1):
-        if selected_result is not None or not failed_original_groups:
-            break
+        Final selection is still finalized in increasing removal_depth order, so
+        deeper speculative results cannot beat a shallower valid round.
+        """
+        nonlocal next_cluster_id, selected_result, cap_stop_event
+        from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 
-        round_entry_rank_pairs = []
-        parent_round_pairs = []
-        still_failed = []
-        for parent_entry in failed_original_groups:
+        max_possible = max([len(entry.get("strokes", [])) - 1 for entry in original_cluster_debug] + [0])
+        if max_subgroup_removals is None or int(max_subgroup_removals) < 0:
+            effective_max_removals = max_possible
+        else:
+            effective_max_removals = min(max_possible, max(0, int(max_subgroup_removals)))
+
+        parent_states = []
+        ready_tasks = []
+        results_by_depth = {}
+        finalized_depth = 0
+        stop_scheduling = False
+
+        def parent_layer_complete(state, depth):
+            expected = state["expected"].get(int(depth), None)
+            if expected is None:
+                return False
+            return len(state["results"].get(int(depth), [])) >= int(expected)
+
+        def parent_layer_passed(state, depth):
+            return any(
+                result.get("selection_passed", False)
+                for result in state["results"].get(int(depth), [])
+            )
+
+        def parent_relevant_at_depth(state, depth):
+            depth = int(depth)
+            if depth == 0:
+                return True
+            if depth > int(state["max_depth"]):
+                return False
+            for prev_depth in range(depth):
+                if prev_depth > int(state["max_depth"]):
+                    return False
+                if not parent_layer_complete(state, prev_depth):
+                    return None
+                if parent_layer_passed(state, prev_depth):
+                    return False
+            return True
+
+        def depth_complete(depth):
+            depth = int(depth)
+            any_relevant = False
+            for state in parent_states:
+                relevant = parent_relevant_at_depth(state, depth)
+                if relevant is None:
+                    return False
+                if not relevant:
+                    continue
+                any_relevant = True
+                if not parent_layer_complete(state, depth):
+                    return False
+            return any_relevant
+
+        def enqueue_entry(state, entry, depth):
+            rank = len(expanded_cluster_debug)
+            expanded_cluster_debug.append(entry)
+            depth = int(depth)
+            state["expected"][depth] = int(state["expected"].get(depth, 0)) + 1
+            ready_tasks.append({
+                "entry": entry,
+                "rank": int(rank),
+                "depth": depth,
+                "state": state,
+            })
+
+        def schedule_parent_depth(state, depth):
+            nonlocal next_cluster_id
+            depth = int(depth)
+            if depth in state["scheduled_depths"]:
+                return
+            if depth > int(state["max_depth"]):
+                return
+            parent_entry = state["entry"]
             parent_strokes = list(parent_entry.get("strokes", []))
-            if len(parent_strokes) - removal_depth < 1:
-                continue
+            if len(parent_strokes) - depth < 1:
+                return
+            state["scheduled_depths"].add(depth)
+            state["results"].setdefault(depth, [])
+            state["expected"].setdefault(depth, 0)
+            if depth == 0:
+                enqueue_entry(state, parent_entry, depth)
+                return
 
-            current_parent_pairs = []
-            for removed_positions in itertools.combinations(range(len(parent_strokes)), removal_depth):
+            for removed_positions in itertools.combinations(range(len(parent_strokes)), depth):
                 removed_positions = set(removed_positions)
                 removed_strokes = [s for i, s in enumerate(parent_strokes) if i in removed_positions]
                 subgroup_strokes = [s for i, s in enumerate(parent_strokes) if i not in removed_positions]
@@ -6272,34 +6566,209 @@ def validate_side_clusters_by_cap_candidates(
                 )
                 next_cluster_id += 1
 
-                subgroup_rank = len(expanded_cluster_debug)
-                expanded_cluster_debug.append(subgroup)
-                pair = (subgroup, subgroup_rank)
-                round_entry_rank_pairs.append(pair)
-                current_parent_pairs.append(pair)
+                enqueue_entry(state, subgroup, depth)
 
-            parent_round_pairs.append((parent_entry, current_parent_pairs))
+        def finalize_available_depths():
+            nonlocal finalized_depth, selected_result, stop_scheduling
+            max_depth = max([int(state["max_depth"]) for state in parent_states] + [0])
+            while finalized_depth <= max_depth:
+                round_results = sorted(
+                    results_by_depth.get(int(finalized_depth), []),
+                    key=lambda result: int(result.get("rank", 0)),
+                )
+                current_winner = choose_round_winner(round_results)
+                if current_winner is not None:
+                    merge_round_trace(round_results)
+                    record_successful_results(round_results)
+                    record_iou_only_rejected_results(round_results)
+                    selected_result = current_winner
+                    cap_search_request_stop(cap_stop_event)
+                    summarize_round(finalized_depth, round_results, selected_result)
+                    flush_round_progress(selected_result)
+                    finalized_depth += 1
+                    stop_scheduling = True
+                    ready_tasks.clear()
+                    break
 
-        round_results = evaluate_round(round_entry_rank_pairs)
-        result_by_rank = {int(result["rank"]): result for result in round_results}
-        for parent_entry, current_parent_pairs in parent_round_pairs:
-            parent_round_results = [
-                result_by_rank[int(rank)]
-                for _entry, rank in current_parent_pairs
-                if int(rank) in result_by_rank
-            ]
-            if parent_unresolved_after_round(parent_entry, parent_round_results, removal_depth):
-                still_failed.append(parent_entry)
+                if not depth_complete(finalized_depth):
+                    break
 
-        record_successful_results(round_results)
-        record_iou_only_rejected_results(round_results)
-        selected_result = choose_round_winner(round_results)
-        summarize_round(removal_depth, round_results, selected_result)
+                merge_round_trace(round_results)
+                record_successful_results(round_results)
+                record_iou_only_rejected_results(round_results)
+                summarize_round(finalized_depth, round_results, None)
+                flush_round_progress(None)
+                finalized_depth += 1
+
+        for parent_i, entry in enumerate(original_cluster_debug):
+            max_depth = min(int(effective_max_removals), max(0, len(entry.get("strokes", [])) - 1))
+            state = {
+                "parent_index": int(parent_i),
+                "entry": entry,
+                "max_depth": int(max_depth),
+                "scheduled_depths": set(),
+                "expected": {},
+                "results": {},
+            }
+            parent_states.append(state)
+            schedule_parent_depth(state, 0)
+
+        def submit_ready(executor, future_to_task):
+            while ready_tasks and len(future_to_task) < int(cap_round_workers) and not stop_scheduling:
+                task = ready_tasks.pop(0)
+                if cap_worker_backend == "process":
+                    payload = build_entry_eval_payload(
+                        task["entry"],
+                        task["rank"],
+                        limit_cv_threads=True,
+                    )
+                    future = executor.submit(evaluate_cap_cluster_entry_worker, payload)
+                else:
+                    future = executor.submit(evaluate_entry, task["entry"], task["rank"])
+                future_to_task[future] = task
+
+        def run_executor_loop(executor):
+            future_to_task = {}
+            submit_ready(executor, future_to_task)
+            while future_to_task or (ready_tasks and not stop_scheduling):
+                submit_ready(executor, future_to_task)
+                if not future_to_task:
+                    break
+                done, _pending = wait(
+                    list(future_to_task.keys()),
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in done:
+                    task = future_to_task.pop(future)
+                    result = future.result()
+                    merge_result_entry(result)
+                    depth = int(task["depth"])
+                    state = task["state"]
+                    state["results"].setdefault(depth, []).append(result)
+                    results_by_depth.setdefault(depth, []).append(result)
+
+                    if (
+                        not stop_scheduling
+                        and parent_layer_complete(state, depth)
+                        and not parent_layer_passed(state, depth)
+                    ):
+                        schedule_parent_depth(state, depth + 1)
+
+                finalize_available_depths()
+                if stop_scheduling:
+                    ready_tasks.clear()
+                    for pending_future in list(future_to_task.keys()):
+                        pending_future.cancel()
+                    future_to_task.clear()
+                    break
+
+        if cap_worker_backend == "process":
+            import multiprocessing
+
+            with multiprocessing.Manager() as manager:
+                cap_stop_event = manager.Event()
+                mp_context = multiprocessing.get_context("spawn")
+                with ProcessPoolExecutor(
+                    max_workers=max(1, int(cap_round_workers)),
+                    mp_context=mp_context,
+                ) as executor:
+                    run_executor_loop(executor)
+        else:
+            import threading
+
+            cap_stop_event = threading.Event()
+            with ThreadPoolExecutor(max_workers=max(1, int(cap_round_workers))) as executor:
+                run_executor_loop(executor)
+
+        finalize_available_depths()
+
+    if cap_round_workers > 1:
+        run_pipelined_cluster_search()
+    else:
+        original_entry_rank_pairs = []
+        for entry in original_cluster_debug:
+            rank = len(expanded_cluster_debug)
+            expanded_cluster_debug.append(entry)
+            original_entry_rank_pairs.append((entry, rank))
+        original_round_results = evaluate_round(original_entry_rank_pairs)
+
+        record_successful_results(original_round_results)
+        record_iou_only_rejected_results(original_round_results)
+        selected_result = choose_round_winner(original_round_results)
+        summarize_round(0, original_round_results, selected_result)
         flush_round_progress(selected_result)
-        if selected_result is not None:
-            break
 
-        failed_original_groups = still_failed
+        failed_original_groups = []
+        if selected_result is None:
+            for result in original_round_results:
+                entry = result["entry"]
+                if len(entry.get("strokes", [])) <= 1:
+                    continue
+                if not result.get("selection_passed", False):
+                    failed_original_groups.append(entry)
+
+        max_possible_removals = 0
+        if failed_original_groups:
+            max_possible_removals = max(len(entry.get("strokes", [])) - 1 for entry in failed_original_groups)
+        if max_subgroup_removals is None or int(max_subgroup_removals) < 0:
+            max_subgroup_removals = max_possible_removals
+        else:
+            max_subgroup_removals = min(max_possible_removals, max(0, int(max_subgroup_removals)))
+
+        for removal_depth in range(1, max_subgroup_removals + 1):
+            if selected_result is not None or not failed_original_groups:
+                break
+
+            round_entry_rank_pairs = []
+            parent_round_pairs = []
+            still_failed = []
+            for parent_entry in failed_original_groups:
+                parent_strokes = list(parent_entry.get("strokes", []))
+                if len(parent_strokes) - removal_depth < 1:
+                    continue
+
+                current_parent_pairs = []
+                for removed_positions in itertools.combinations(range(len(parent_strokes)), removal_depth):
+                    removed_positions = set(removed_positions)
+                    removed_strokes = [s for i, s in enumerate(parent_strokes) if i in removed_positions]
+                    subgroup_strokes = [s for i, s in enumerate(parent_strokes) if i not in removed_positions]
+
+                    subgroup = make_removed_subgroup_entry(
+                        parent_entry,
+                        removed_strokes,
+                        subgroup_strokes,
+                        cluster_id=next_cluster_id,
+                    )
+                    next_cluster_id += 1
+
+                    subgroup_rank = len(expanded_cluster_debug)
+                    expanded_cluster_debug.append(subgroup)
+                    pair = (subgroup, subgroup_rank)
+                    round_entry_rank_pairs.append(pair)
+                    current_parent_pairs.append(pair)
+
+                parent_round_pairs.append((parent_entry, current_parent_pairs))
+
+            round_results = evaluate_round(round_entry_rank_pairs)
+            result_by_rank = {int(result["rank"]): result for result in round_results}
+            for parent_entry, current_parent_pairs in parent_round_pairs:
+                parent_round_results = [
+                    result_by_rank[int(rank)]
+                    for _entry, rank in current_parent_pairs
+                    if int(rank) in result_by_rank
+                ]
+                if parent_unresolved_after_round(parent_entry, parent_round_results, removal_depth):
+                    still_failed.append(parent_entry)
+
+            record_successful_results(round_results)
+            record_iou_only_rejected_results(round_results)
+            selected_result = choose_round_winner(round_results)
+            summarize_round(removal_depth, round_results, selected_result)
+            flush_round_progress(selected_result)
+            if selected_result is not None:
+                break
+
+            failed_original_groups = still_failed
 
     if selected_result is None and iou_only_rejected_results:
         selected_result = max(iou_only_rejected_results, key=winner_sort_key)
@@ -6313,6 +6782,7 @@ def validate_side_clusters_by_cap_candidates(
     model["side_cap_connect_enabled"] = bool(float(side_cap_connect_tol or 0.0) > 0.0)
     model["side_cap_connect_tol"] = float(side_cap_connect_tol or 0.0)
     model["cap_round_workers"] = int(cap_round_workers)
+    model["cap_worker_backend"] = cap_worker_backend
     model["cap_validation_used_iou_fallback"] = bool(selected_via_iou_fallback)
     model["successful_cap_clusters"] = [
         {
@@ -6356,14 +6826,14 @@ def validate_side_clusters_by_cap_candidates(
     validated_model["cap_validation_failed"] = False
     if sweep_gate_enabled:
         validated_model["cap_validation_message"] = (
-            "Computed every subgroup in each removal-depth round and stopped only when a round produced at least one cap "
-            "whose swept extrusion occupancy IoU passed the input enclosed-mask threshold and whose side strokes passed "
-            "the side-cap connection gate. The selected entry is the highest-IoU candidate from that stopping round."
+            "Evaluated cap-search clusters/subgroups with the configured worker backend and stopped when the shallowest "
+            "finalized removal depth produced a cap whose swept extrusion occupancy IoU passed the input enclosed-mask "
+            "threshold and whose side strokes passed the side-cap connection gate."
         )
     else:
         validated_model["cap_validation_message"] = (
-            "Computed best cap for every full direction group first. If none had a legal cap, computed every remove-k subgroup "
-            "round by round until one entry produced a legal cap."
+            "Evaluated cap-search clusters/subgroups with the configured worker backend. If no full direction group had a "
+            "legal cap, remove-k subgroups were evaluated until the shallowest finalized depth produced a legal cap."
         )
     validated_model["successful_cap_clusters"] = model.get("successful_cap_clusters", [])
     validated_model["cap_search_trace"] = cap_search_trace
@@ -6372,6 +6842,7 @@ def validate_side_clusters_by_cap_candidates(
     validated_model["side_cap_connect_enabled"] = bool(float(side_cap_connect_tol or 0.0) > 0.0)
     validated_model["side_cap_connect_tol"] = float(side_cap_connect_tol or 0.0)
     validated_model["cap_round_workers"] = int(cap_round_workers)
+    validated_model["cap_worker_backend"] = cap_worker_backend
     validated_model["cap_validation_used_iou_fallback"] = bool(selected_via_iou_fallback)
     validated_model["side_cap_connect_passed"] = bool(
         selected_entry.get("details", {}).get("side_cap_connect_passed", True)
@@ -10020,8 +10491,8 @@ def write_cluster_cap_search_step(debug_dir, entry, rank, event, **extra):
         f.write(json.dumps(payload, ensure_ascii=True) + '\n')
 
 
-def save_cluster_progress_preview_outputs(debug_dir, img_shape, entry, rank, infos, cap_pool_infos, endpoint_tol):
-    if debug_dir is None:
+def save_cluster_progress_preview_outputs(debug_dir, img_shape, entry, rank, infos, cap_pool_infos, endpoint_tol, stop_event=None):
+    if debug_dir is None or cap_search_stop_requested(stop_event):
         return
 
     cluster_dir = os.path.join(debug_dir, 'clusters')
@@ -10135,8 +10606,9 @@ def save_single_cluster_candidate_debug_output(
     sweep_iou_stop_thresh=0.0,
     copy_direction_angle_tol=None,
     copy_iou_compare_percent=None,
+    stop_event=None,
 ):
-    if debug_dir is None:
+    if debug_dir is None or cap_search_stop_requested(stop_event):
         return
 
     cluster_dir = os.path.join(debug_dir, 'clusters')
@@ -10150,10 +10622,20 @@ def save_single_cluster_candidate_debug_output(
     sketch_area = binary_mask_area(sketch_mask) if sketch_mask is not None else 0
     cap_pool_infos = infos if cap_pool_infos is None else cap_pool_infos
 
+    if cap_search_stop_requested(stop_event):
+        return
     cv2.imwrite(os.path.join(out_dir, 'cluster.png'), draw_single_cluster_image(img_shape, entry, selected=False, thickness=4))
+    if cap_search_stop_requested(stop_event):
+        return
     cv2.imwrite(os.path.join(out_dir, 'best_cap.png'), draw_cluster_best_cap_image(img_shape, entry, cap_candidate=best_cap, selected=False))
+    if cap_search_stop_requested(stop_event):
+        return
     cv2.imwrite(os.path.join(out_dir, 'cap_pool.png'), draw_cap_pool_image(img_shape, entry, infos, cap_pool_infos))
+    if cap_search_stop_requested(stop_event):
+        return
     write_cap_pool_debug_json(os.path.join(out_dir, 'cap_pool.json'), entry, rank, cap_pool_infos)
+    if cap_search_stop_requested(stop_event):
+        return
     write_component_normalization_debug_json(
         os.path.join(out_dir, 'components_normalized.json'),
         entry,
@@ -10161,6 +10643,8 @@ def save_single_cluster_candidate_debug_output(
         cap_pool_infos,
         endpoint_tol,
     )
+    if cap_search_stop_requested(stop_event):
+        return
     save_component_normalization_debug_pngs(
         out_dir,
         img_shape,
@@ -10177,6 +10661,8 @@ def save_single_cluster_candidate_debug_output(
 
     candidate_summaries = []
     for idx, result in enumerate(cap_evaluations):
+        if cap_search_stop_requested(stop_event):
+            return
         cap_candidate = result.get('cap_candidate')
         sweep_info = result.get('sweep_info') or {}
         connection_info = result.get('connection_info') or {}
@@ -11626,7 +12112,9 @@ def main():
     parser.add_argument("--cap-subgroup-max-removals", type=int, default=-1,
                         help="Max remove-k subgroup depth for direction groups that have no valid cap. Use -1 to continue until one stroke remains.")
     parser.add_argument("--cap-round-workers", "--cap-round-threads", type=int, default=1,
-                        help="Number of CPU worker threads used to evaluate clusters/subgroups within one cap-search round. 1 keeps serial behavior.")
+                        help="Number of CPU workers used to evaluate cap-search clusters/subgroups. 1 keeps serial behavior.")
+    parser.add_argument("--cap-worker-backend", choices=("thread", "process"), default="thread",
+                        help="Parallel backend for --cap-round-workers > 1. process uses separate Python processes for true multi-core CPU execution.")
 
     args = parser.parse_args()
 
@@ -11767,6 +12255,7 @@ def main():
         side_cap_connect_tol=args.side_cap_connect_tol,
         progress_debug_dir=args.debug_dir,
         cap_round_workers=args.cap_round_workers,
+        cap_worker_backend=args.cap_worker_backend,
     )
     save_model_debug_outputs(args.debug_dir, img.shape, model, infos, args)
 

@@ -1,6 +1,7 @@
 import argparse
 import os
 import runpy
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,6 +22,13 @@ def run_script(script_path, script_args, cwd):
     finally:
         sys.argv = old_argv
         os.chdir(old_cwd)
+
+
+def run_script_subprocess(script_path, script_args, cwd):
+    cmd = [sys.executable, str(script_path), *[str(part) for part in script_args]]
+    print("\nRunning:")
+    print("subprocess " + " ".join(cmd))
+    subprocess.run(cmd, cwd=str(cwd), check=True)
 
 
 def main():
@@ -128,7 +136,13 @@ def main():
         "--cap-round-threads",
         type=int,
         default=1,
-        help="Forwarded to the extrusion script. CPU worker threads for evaluating clusters/subgroups within one cap-search round.",
+        help="Forwarded to the extrusion script. CPU workers for evaluating cap-search clusters/subgroups.",
+    )
+    parser.add_argument(
+        "--cap-worker-backend",
+        choices=("thread", "process"),
+        default="thread",
+        help="Forwarded to the extrusion script. Use process for true multi-core cap-search workers.",
     )
     parser.add_argument("--min-cap-total-arc", type=float, default=50)
     parser.add_argument("--split-segment-arc", type=float, default=30)
@@ -308,6 +322,8 @@ def main():
             str(args.side_cap_connect_tol),
             "--cap-round-workers",
             str(args.cap_round_workers),
+            "--cap-worker-backend",
+            str(args.cap_worker_backend),
             "--min-cap-total-arc",
             str(args.min_cap_total_arc),
             "--split-segment-arc",
@@ -330,7 +346,10 @@ def main():
             ])
         if args.force_parallel:
             extrusion_args.append("--force-parallel")
-        run_script(extrusion_script, extrusion_args, cwd)
+        if args.cap_worker_backend == "process" and int(args.cap_round_workers or 1) > 1:
+            run_script_subprocess(extrusion_script, extrusion_args, cwd)
+        else:
+            run_script(extrusion_script, extrusion_args, cwd)
 
     if not args.skip_recover:
         recover_args = [
